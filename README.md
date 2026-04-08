@@ -32,8 +32,8 @@ pip install langchain-task-steering
 For development:
 
 ```bash
-git clone https://github.com/edvinhallvaxhiu/task-steering
-cd task-steering
+git clone https://github.com/edvinhallvaxhiu/langchain-task-steering
+cd langchain-task-steering
 pip install -e ".[dev]"
 ```
 
@@ -48,7 +48,7 @@ pip install -e ".[dev]"
 ```python
 from langchain.agents import create_agent
 from langchain.tools import tool
-from task_steering import TaskSteeringMiddleware, Task
+from langchain_task_steering import TaskSteeringMiddleware, Task
 
 
 @tool
@@ -122,6 +122,7 @@ Only the active task's tools (plus globals and `update_task_status`) are visible
 | `before_agent` | Initializes `task_statuses` in state on first invocation. |
 | `wrap_model_call` | Appends task status board + active task instruction to system prompt. Filters tools to only the active task's tools + globals + `update_task_status`. Delegates to task-scoped middleware if present. |
 | `wrap_tool_call` | Intercepts `update_task_status` — runs `validate_completion` on the task's scoped middleware before allowing completion. Rejects out-of-scope tool calls. Delegates other tool calls to the active task's scoped middleware. |
+| `after_agent` | Checks if required tasks are complete. If not, nudges the agent with a `HumanMessage` and jumps back to the model (up to `max_nudges` times). |
 | `tools` | Auto-registers all task tools + globals + `update_task_status` with the agent. |
 
 ### Task lifecycle
@@ -141,7 +142,7 @@ Each task can have a `TaskMiddleware` that activates only when the task is `IN_P
 
 ```python
 from langchain.messages import ToolMessage
-from task_steering import Task, TaskMiddleware, TaskSteeringMiddleware
+from langchain_task_steering import Task, TaskMiddleware, TaskSteeringMiddleware
 
 
 class ThreatsMiddleware(TaskMiddleware):
@@ -212,6 +213,26 @@ class ThreatsMiddleware(TaskMiddleware):
 
 `TaskSteeringMiddleware` automatically merges all task middleware schemas into its own `state_schema`, so the fields survive checkpointing and interrupts.
 
+## Required tasks
+
+By default, all tasks are required — if the agent tries to exit without completing them, the middleware nudges it back with a `HumanMessage` listing the incomplete tasks.
+
+```python
+# All tasks required (default)
+pipeline = TaskSteeringMiddleware(tasks=tasks)
+
+# Only specific tasks required
+pipeline = TaskSteeringMiddleware(tasks=tasks, required_tasks=["collect", "review"])
+
+# No tasks required (agent can exit at any time)
+pipeline = TaskSteeringMiddleware(tasks=tasks, required_tasks=None)
+
+# Custom nudge limit (default is 3)
+pipeline = TaskSteeringMiddleware(tasks=tasks, max_nudges=5)
+```
+
+The nudge mechanism uses the `after_agent` hook with `jump_to: "model"` to re-enter the agent loop. After `max_nudges` attempts, the agent is allowed to exit regardless.
+
 ## Configuration
 
 | Parameter | Default | Description |
@@ -219,6 +240,8 @@ class ThreatsMiddleware(TaskMiddleware):
 | `tasks` | *(required)* | Ordered list of `Task` definitions. |
 | `global_tools` | `[]` | Tools available in every task. |
 | `enforce_order` | `True` | Require tasks to be completed in definition order. |
+| `required_tasks` | `["*"]` | Tasks that must be completed before the agent can exit. `["*"]` = all, `None` = none, or a list of task names. |
+| `max_nudges` | `3` | Max times the agent is nudged to complete required tasks before being allowed to exit. |
 
 ### Task fields
 
@@ -259,14 +282,14 @@ pip install -e ".[dev]"
 pytest
 
 # Run tests with coverage
-pytest --cov=task_steering
+pytest --cov=langchain_task_steering
 ```
 
 ## Project structure
 
 ```
-task-steering/
-  src/task_steering/
+langchain-task-steering/
+  src/langchain_task_steering/
     __init__.py          # Public exports
     types.py             # Task, TaskMiddleware, TaskStatus, TaskSteeringState
     middleware.py         # TaskSteeringMiddleware implementation

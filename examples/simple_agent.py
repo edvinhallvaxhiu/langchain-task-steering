@@ -4,7 +4,7 @@ from langchain.agents import create_agent
 from langchain.tools import tool
 from langchain_aws import ChatBedrockConverse
 
-from task_steering import Task, TaskMiddleware, TaskSteeringMiddleware
+from langchain_task_steering import Task, TaskMiddleware, TaskSteeringMiddleware
 
 
 # ── Tools ────────────────────────────────────────────────────

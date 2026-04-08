@@ -5,7 +5,8 @@ from collections.abc import Callable
 from typing import Annotated, Any
 
 from langchain.agents.middleware import AgentMiddleware, ModelRequest, ModelResponse
-from langchain.messages import SystemMessage, ToolMessage
+from langchain.agents.middleware import hook_config
+from langchain.messages import HumanMessage, SystemMessage, ToolMessage
 from langchain.tools import tool, ToolRuntime
 from langchain.tools.tool_node import ToolCallRequest
 from langgraph.runtime import Runtime
@@ -15,6 +16,7 @@ from typing_extensions import TypedDict
 from .types import Task, TaskMiddleware, TaskStatus, TaskSteeringState
 
 _TRANSITION_TOOL_NAME = "update_task_status"
+_REQUIRE_ALL = ["*"]
 
 
 class TaskSteeringMiddleware(AgentMiddleware[TaskSteeringState]):
@@ -46,6 +48,8 @@ class TaskSteeringMiddleware(AgentMiddleware[TaskSteeringState]):
         tasks: list[Task],
         global_tools: list | None = None,
         enforce_order: bool = True,
+        required_tasks: list[str] | None = _REQUIRE_ALL,
+        max_nudges: int = 3,
     ) -> None:
         super().__init__()
         if not tasks:
@@ -61,6 +65,18 @@ class TaskSteeringMiddleware(AgentMiddleware[TaskSteeringState]):
         self._task_map: dict[str, Task] = {t.name: t for t in tasks}
         self._global_tools: list = global_tools or []
         self._enforce_order = enforce_order
+        self._max_nudges = max_nudges
+
+        # Resolve required_tasks
+        if required_tasks is not None and "*" in required_tasks:
+            self._required_tasks: set[str] = {t.name for t in tasks}
+        elif required_tasks is not None:
+            unknown = set(required_tasks) - set(names)
+            if unknown:
+                raise ValueError(f"Unknown required tasks: {unknown}")
+            self._required_tasks = set(required_tasks)
+        else:
+            self._required_tasks = set()
 
         self._transition_tool = self._build_transition_tool()
 
@@ -94,6 +110,42 @@ class TaskSteeringMiddleware(AgentMiddleware[TaskSteeringState]):
                 "task_statuses": {t.name: TaskStatus.PENDING.value for t in self._tasks}
             }
         return None
+
+    @hook_config(can_jump_to=["model"])
+    def after_agent(
+        self, state: TaskSteeringState, runtime: Runtime
+    ) -> dict[str, Any] | None:
+        """Nudge the agent back to the model if required tasks are incomplete."""
+        if not self._required_tasks:
+            return None
+
+        statuses = self._get_statuses(state)
+        incomplete = [
+            name for name in self._task_order
+            if name in self._required_tasks
+            and statuses[name] != TaskStatus.COMPLETE.value
+        ]
+
+        if not incomplete:
+            return None
+
+        nudge_count = state.get("nudge_count", 0)
+        if nudge_count >= self._max_nudges:
+            return None
+
+        task_list = ", ".join(incomplete)
+        nudge_msg = HumanMessage(
+            content=(
+                f"You have not completed the following required tasks: "
+                f"{task_list}. Please continue."
+            ),
+        )
+
+        return {
+            "jump_to": "model",
+            "nudge_count": nudge_count + 1,
+            "messages": [nudge_msg],
+        }
 
     # ── Wrap-style hooks ──────────────────────────────────────
 
