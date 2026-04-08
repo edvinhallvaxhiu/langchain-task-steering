@@ -1,4 +1,4 @@
-# task-steering
+# langchain-task-steering
 
 Implicit state-machine middleware for [LangChain v1](https://python.langchain.com/) agents. Define ordered task pipelines with per-task tool scoping, dynamic prompt injection, and composable validation — all as a drop-in `AgentMiddleware`.
 
