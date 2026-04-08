@@ -3,7 +3,7 @@ requires = ["hatchling"]
 build-backend = "hatchling.build"
 
 [project]
-name = "task-steering"
+name = "langchain-task-steering"
 version = "0.1.0"
 description = "Implicit state machine middleware for LangChain v1 agents. Ordered task pipelines with per-task tool scoping, prompt injection, and composable validation."
 readme = "README.md"
@@ -29,9 +29,9 @@ dependencies = [
 ]
 
 [project.urls]
-Homepage = "https://github.com/edvinhallvaxhiu/task-steering"
-Repository = "https://github.com/edvinhallvaxhiu/task-steering"
-Issues = "https://github.com/edvinhallvaxhiu/task-steering/issues"
+Homepage = "https://github.com/edvinhallvaxhiu/langchain-task-steering"
+Repository = "https://github.com/edvinhallvaxhiu/langchain-task-steering"
+Issues = "https://github.com/edvinhallvaxhiu/langchain-task-steering/issues"
 
 [project.optional-dependencies]
 dev = [
