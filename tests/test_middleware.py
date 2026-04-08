@@ -15,13 +15,14 @@ from langchain.messages import ToolMessage
 from langchain.tools import tool
 from typing_extensions import NotRequired
 
-from task_steering import (
+from langchain_task_steering import (
     Task,
     TaskMiddleware,
     TaskStatus,
     TaskSteeringMiddleware,
     TaskSteeringState,
 )
+from langchain_task_steering.middleware import _REQUIRE_ALL
 from tests.conftest import (
     AllowCompletionMiddleware,
     MockModelRequest,
@@ -926,3 +927,191 @@ class TestScenario:
         result = mw.wrap_tool_call(complete_req, MagicMock())
         assert isinstance(result, ToolMessage)
         assert "Cannot complete 'review'" in result.content
+
+
+# ════════════════════════════════════════════════════════════
+# Init — required_tasks validation
+# ════════════════════════════════════════════════════════════
+
+
+class TestRequiredTasksInit:
+    def test_default_is_all(self, three_tasks):
+        mw = TaskSteeringMiddleware(tasks=three_tasks)
+        assert mw._required_tasks == {"step_1", "step_2", "step_3"}
+
+    def test_wildcard_resolves_to_all(self, three_tasks):
+        mw = TaskSteeringMiddleware(tasks=three_tasks, required_tasks=["*"])
+        assert mw._required_tasks == {"step_1", "step_2", "step_3"}
+
+    def test_explicit_subset(self, three_tasks):
+        mw = TaskSteeringMiddleware(tasks=three_tasks, required_tasks=["step_1", "step_3"])
+        assert mw._required_tasks == {"step_1", "step_3"}
+
+    def test_none_means_no_required(self, three_tasks):
+        mw = TaskSteeringMiddleware(tasks=three_tasks, required_tasks=None)
+        assert mw._required_tasks == set()
+
+    def test_unknown_task_raises(self, three_tasks):
+        with pytest.raises(ValueError, match="Unknown required tasks"):
+            TaskSteeringMiddleware(tasks=three_tasks, required_tasks=["nonexistent"])
+
+    def test_max_nudges_default(self, three_tasks):
+        mw = TaskSteeringMiddleware(tasks=three_tasks)
+        assert mw._max_nudges == 3
+
+    def test_max_nudges_custom(self, three_tasks):
+        mw = TaskSteeringMiddleware(tasks=three_tasks, max_nudges=5)
+        assert mw._max_nudges == 5
+
+
+# ════════════════════════════════════════════════════════════
+# after_agent — required task nudging
+# ════════════════════════════════════════════════════════════
+
+
+class TestAfterAgent:
+    def test_nudges_when_required_tasks_incomplete(self):
+        tasks = [
+            Task(name="a", instruction="A", tools=[tool_a]),
+            Task(name="b", instruction="B", tools=[tool_b]),
+        ]
+        mw = TaskSteeringMiddleware(tasks=tasks)
+
+        state = {
+            "messages": [],
+            "task_statuses": {"a": "complete", "b": "pending"},
+        }
+
+        result = mw.after_agent(state, runtime=None)
+        assert result is not None
+        assert result["jump_to"] == "model"
+        assert result["nudge_count"] == 1
+        assert len(result["messages"]) == 1
+        assert "b" in result["messages"][0].content
+        assert "required tasks" in result["messages"][0].content
+
+    def test_no_nudge_when_all_complete(self):
+        tasks = [
+            Task(name="a", instruction="A", tools=[tool_a]),
+            Task(name="b", instruction="B", tools=[tool_b]),
+        ]
+        mw = TaskSteeringMiddleware(tasks=tasks)
+
+        state = {
+            "messages": [],
+            "task_statuses": {"a": "complete", "b": "complete"},
+        }
+
+        result = mw.after_agent(state, runtime=None)
+        assert result is None
+
+    def test_no_nudge_when_required_tasks_is_none(self):
+        tasks = [
+            Task(name="a", instruction="A", tools=[tool_a]),
+        ]
+        mw = TaskSteeringMiddleware(tasks=tasks, required_tasks=None)
+
+        state = {
+            "messages": [],
+            "task_statuses": {"a": "pending"},
+        }
+
+        result = mw.after_agent(state, runtime=None)
+        assert result is None
+
+    def test_only_checks_required_subset(self):
+        tasks = [
+            Task(name="a", instruction="A", tools=[tool_a]),
+            Task(name="b", instruction="B", tools=[tool_b]),
+        ]
+        mw = TaskSteeringMiddleware(tasks=tasks, required_tasks=["a"])
+
+        state = {
+            "messages": [],
+            "task_statuses": {"a": "complete", "b": "pending"},
+        }
+
+        # "b" is incomplete but not required — no nudge
+        result = mw.after_agent(state, runtime=None)
+        assert result is None
+
+    def test_nudge_lists_only_incomplete_required(self):
+        tasks = [
+            Task(name="a", instruction="A", tools=[tool_a]),
+            Task(name="b", instruction="B", tools=[tool_b]),
+            Task(name="c", instruction="C", tools=[tool_c]),
+        ]
+        mw = TaskSteeringMiddleware(tasks=tasks, required_tasks=["a", "c"])
+
+        state = {
+            "messages": [],
+            "task_statuses": {"a": "complete", "b": "pending", "c": "pending"},
+        }
+
+        result = mw.after_agent(state, runtime=None)
+        assert result is not None
+        # Only "c" should be listed as incomplete (not "a" which is complete)
+        msg = result["messages"][0].content
+        assert "required tasks: c." in msg
+
+    def test_stops_nudging_after_max_nudges(self):
+        tasks = [
+            Task(name="a", instruction="A", tools=[tool_a]),
+        ]
+        mw = TaskSteeringMiddleware(tasks=tasks, max_nudges=2)
+
+        state = {
+            "messages": [],
+            "task_statuses": {"a": "pending"},
+            "nudge_count": 2,
+        }
+
+        result = mw.after_agent(state, runtime=None)
+        assert result is None
+
+    def test_increments_nudge_count(self):
+        tasks = [
+            Task(name="a", instruction="A", tools=[tool_a]),
+        ]
+        mw = TaskSteeringMiddleware(tasks=tasks, max_nudges=3)
+
+        state = {
+            "messages": [],
+            "task_statuses": {"a": "pending"},
+            "nudge_count": 1,
+        }
+
+        result = mw.after_agent(state, runtime=None)
+        assert result is not None
+        assert result["nudge_count"] == 2
+
+    def test_nudge_count_defaults_to_zero(self):
+        tasks = [
+            Task(name="a", instruction="A", tools=[tool_a]),
+        ]
+        mw = TaskSteeringMiddleware(tasks=tasks)
+
+        state = {
+            "messages": [],
+            "task_statuses": {"a": "pending"},
+        }
+
+        result = mw.after_agent(state, runtime=None)
+        assert result is not None
+        assert result["nudge_count"] == 1
+
+    def test_nudges_in_progress_task(self):
+        """A task that is in_progress but not complete should still be nudged."""
+        tasks = [
+            Task(name="a", instruction="A", tools=[tool_a]),
+        ]
+        mw = TaskSteeringMiddleware(tasks=tasks)
+
+        state = {
+            "messages": [],
+            "task_statuses": {"a": "in_progress"},
+        }
+
+        result = mw.after_agent(state, runtime=None)
+        assert result is not None
+        assert "a" in result["messages"][0].content

@@ -14,7 +14,7 @@ pytest.importorskip(
 from langchain.messages import ToolMessage
 from langchain.tools import tool
 
-from task_steering import Task, TaskMiddleware, TaskSteeringMiddleware
+from langchain_task_steering import Task, TaskMiddleware, TaskSteeringMiddleware
 
 
 # ── Mock tools ──────────────────────────────────────────────

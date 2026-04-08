@@ -21,6 +21,7 @@ class TaskSteeringState(AgentState):
     """Extends AgentState with task tracking managed by the middleware."""
 
     task_statuses: NotRequired[dict[str, str]]
+    nudge_count: NotRequired[int]
 
 
 class TaskMiddleware(AgentMiddleware):
