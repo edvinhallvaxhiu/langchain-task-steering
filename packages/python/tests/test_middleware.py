@@ -944,7 +944,9 @@ class TestRequiredTasksInit:
         assert mw._required_tasks == {"step_1", "step_2", "step_3"}
 
     def test_explicit_subset(self, three_tasks):
-        mw = TaskSteeringMiddleware(tasks=three_tasks, required_tasks=["step_1", "step_3"])
+        mw = TaskSteeringMiddleware(
+            tasks=three_tasks, required_tasks=["step_1", "step_3"]
+        )
         assert mw._required_tasks == {"step_1", "step_3"}
 
     def test_none_means_no_required(self, three_tasks):
