@@ -1,8 +1,8 @@
 # langchain-task-steering
 
-Implicit state-machine middleware for LangChain agents. Define ordered task pipelines with per-task tool scoping, dynamic prompt injection, and composable validation.
+Implicit state-machine middleware for [LangChain v1](https://python.langchain.com/) agents. Define ordered task pipelines with per-task tool scoping, dynamic prompt injection, and composable validation — all as a drop-in `AgentMiddleware`.
 
-Available for both **Python** and **TypeScript**.
+Also available for [TypeScript/JavaScript](https://www.npmjs.com/package/langchain-task-steering).
 
 ```
 PENDING ──> IN_PROGRESS ──> COMPLETE
@@ -27,23 +27,25 @@ The model drives its own transitions by calling `update_task_status`. The middle
 
 ## Install
 
-### Python
-
 ```bash
 pip install langchain-task-steering
 ```
 
-**Requirements:** Python >= 3.10, `langchain >= 1.0.0`, `langgraph >= 0.4.0`
-
-### TypeScript / JavaScript
+For development:
 
 ```bash
-npm install langchain-task-steering
+git clone https://github.com/edvinhallvaxhiu/langchain-task-steering
+cd langchain-task-steering/packages/python
+pip install -e ".[dev]"
 ```
 
-## Quick start
+### Requirements
 
-### Python
+- Python >= 3.10
+- `langchain >= 1.0.0`
+- `langgraph >= 0.4.0`
+
+## Quick start
 
 ```python
 from langchain.agents import create_agent
@@ -89,43 +91,6 @@ result = agent.invoke(
 )
 ```
 
-### TypeScript
-
-```typescript
-import { TaskSteeringMiddleware, type Task, type ToolLike } from "langchain-task-steering";
-
-const addItems: ToolLike = {
-  name: "add_items",
-  description: "Add items to the inventory.",
-};
-
-const categorize: ToolLike = {
-  name: "categorize",
-  description: "Assign items to categories.",
-};
-
-const pipeline = new TaskSteeringMiddleware({
-  tasks: [
-    {
-      name: "collect",
-      instruction: "Collect all relevant items from the user's input.",
-      tools: [addItems],
-    },
-    {
-      name: "categorize",
-      instruction: "Organize the collected items into categories.",
-      tools: [categorize],
-    },
-  ],
-});
-
-// pipeline.tools           — all tools to register with the agent
-// pipeline.beforeAgent()   — call on first invocation to init state
-// pipeline.wrapModelCall() — wrap model calls for prompt injection + tool scoping
-// pipeline.wrapToolCall()  — wrap tool calls for validation + delegation
-// pipeline.afterAgent()    — call after agent to check required tasks
-```
-
 The agent automatically receives an `update_task_status` tool and sees a task pipeline block in its system prompt. It must complete `collect` before starting `categorize`.
 
 ## How it works
@@ -156,10 +121,10 @@ Only the active task's tools (plus globals and `update_task_status`) are visible
 
 | Hook | Behavior |
 |---|---|
-| `beforeAgent` | Initializes `taskStatuses` in state on first invocation. |
-| `wrapModelCall` | Appends task status board + active task instruction to system prompt. Filters tools to only the active task's tools + globals + `update_task_status`. Delegates to task-scoped middleware if present. |
-| `wrapToolCall` | Intercepts `update_task_status` — runs `validateCompletion` on the task's scoped middleware before allowing completion. Rejects out-of-scope tool calls. Delegates other tool calls to the active task's scoped middleware. |
-| `afterAgent` | Checks if required tasks are complete. If not, nudges the agent back (up to `maxNudges` times). |
+| `before_agent` | Initializes `task_statuses` in state on first invocation. |
+| `wrap_model_call` | Appends task status board + active task instruction to system prompt. Filters tools to only the active task's tools + globals + `update_task_status`. Delegates to task-scoped middleware if present. |
+| `wrap_tool_call` | Intercepts `update_task_status` — runs `validate_completion` on the task's scoped middleware before allowing completion. Rejects out-of-scope tool calls. Delegates other tool calls to the active task's scoped middleware. |
+| `after_agent` | Checks if required tasks are complete. If not, nudges the agent with a `HumanMessage` and jumps back to the model (up to `max_nudges` times). |
 | `tools` | Auto-registers all task tools + globals + `update_task_status` with the agent. |
 
 ### Task lifecycle
@@ -170,14 +135,12 @@ PENDING ──> IN_PROGRESS ──> COMPLETE
 
 - The agent drives transitions by calling `update_task_status(task, status)`.
 - Transitions are enforced: `pending -> in_progress -> complete` only.
-- When `enforceOrder` is true, a task cannot start until all preceding tasks are complete.
-- On `complete`, the task's `middleware.validateCompletion(state)` runs first — rejection returns an error to the agent without completing the transition.
+- When `enforce_order=True`, a task cannot start until all preceding tasks are complete.
+- On `complete`, the task's `middleware.validate_completion(state)` runs first — rejection returns an error to the agent without completing the transition.
 
 ## Task-scoped middleware
 
 Each task can have a `TaskMiddleware` that activates only when the task is `IN_PROGRESS`. This enables mid-task enforcement, not just completion gating.
-
-### Python
 
 ```python
 from langchain.messages import ToolMessage
@@ -206,63 +169,81 @@ class ThreatsMiddleware(TaskMiddleware):
                     tool_call_id=request.tool_call["id"],
                 )
         return handler(request)
-```
 
-### TypeScript
 
-```typescript
-import { TaskMiddleware, type ToolCallRequest, type ToolCallHandler, type ToolMessageResult, type CommandResult } from "langchain-task-steering";
-
-class ThreatsMiddleware extends TaskMiddleware {
-  constructor(private minThreats: number = 25) {
-    super();
-  }
-
-  validateCompletion(state: Record<string, unknown>): string | null {
-    const threats = (state.threats as unknown[]) ?? [];
-    if (threats.length < this.minThreats) {
-      return `Only ${threats.length} threats — need at least ${this.minThreats}.`;
-    }
-    return null;
-  }
-
-  wrapToolCall(
-    request: ToolCallRequest,
-    handler: ToolCallHandler
-  ): ToolMessageResult | CommandResult {
-    if (request.toolCall.name === "gap_analysis") {
-      const threats = (request.state.threats as unknown[]) ?? [];
-      if (threats.length < this.minThreats) {
-        return {
-          content: `Cannot run gap_analysis: ${threats.length}/${this.minThreats} threats.`,
-          toolCallId: request.toolCall.id,
-        };
-      }
-    }
-    return handler(request);
-  }
-}
+pipeline = TaskSteeringMiddleware(
+    tasks=[
+        Task(name="assets", instruction="...", tools=[create_assets]),
+        Task(
+            name="threats",
+            instruction="Identify STRIDE threats for each asset.",
+            tools=[create_threats, gap_analysis],
+            middleware=ThreatsMiddleware(min_threats=25),
+        ),
+    ],
+)
 ```
 
 ### TaskMiddleware hooks
 
 | Method | When it runs | Purpose |
 |---|---|---|
-| `validateCompletion(state)` | Before `complete` transition | Return error string to reject, `null` to allow |
-| `onStart(state)` | After successful `in_progress` transition | Side effects (logging, state init) |
-| `onComplete(state)` | After successful `complete` transition | Side effects (trail capture, cleanup) |
-| `wrapToolCall(request, handler)` | On every tool call during this task | Mid-task tool gating / modification |
-| `wrapModelCall(request, handler)` | On every model call during this task | Extra prompt injection / request modification |
+| `validate_completion(state)` | Before `complete` transition | Return error string to reject, `None` to allow |
+| `on_start(state)` | After successful `in_progress` transition | Side effects (logging, state init) |
+| `on_complete(state)` | After successful `complete` transition | Side effects (trail capture, cleanup) |
+| `wrap_tool_call(request, handler)` | On every tool call during this task | Mid-task tool gating / modification |
+| `wrap_model_call(request, handler)` | On every model call during this task | Extra prompt injection / request modification |
+| `state_schema` | At middleware init | Merge custom state fields into the agent's state |
+
+### Persistent state for task middleware
+
+Task middleware can declare a `state_schema` to persist custom fields across interrupts:
+
+```python
+from langchain.agents import AgentState
+from typing_extensions import NotRequired
+
+
+class ThreatsState(AgentState):
+    gap_analysis_uses: NotRequired[int]
+
+
+class ThreatsMiddleware(TaskMiddleware):
+    state_schema = ThreatsState
+    # ...
+```
+
+`TaskSteeringMiddleware` automatically merges all task middleware schemas into its own `state_schema`, so the fields survive checkpointing and interrupts.
+
+## Required tasks
+
+By default, all tasks are required — if the agent tries to exit without completing them, the middleware nudges it back with a `HumanMessage` listing the incomplete tasks.
+
+```python
+# All tasks required (default)
+pipeline = TaskSteeringMiddleware(tasks=tasks)
+
+# Only specific tasks required
+pipeline = TaskSteeringMiddleware(tasks=tasks, required_tasks=["collect", "review"])
+
+# No tasks required (agent can exit at any time)
+pipeline = TaskSteeringMiddleware(tasks=tasks, required_tasks=None)
+
+# Custom nudge limit (default is 3)
+pipeline = TaskSteeringMiddleware(tasks=tasks, max_nudges=5)
+```
+
+The nudge mechanism uses the `after_agent` hook with `jump_to: "model"` to re-enter the agent loop. After `max_nudges` attempts, the agent is allowed to exit regardless.
 
 ## Configuration
 
 | Parameter | Default | Description |
 |---|---|---|
 | `tasks` | *(required)* | Ordered list of `Task` definitions. |
-| `globalTools` | `[]` | Tools available in every task. |
-| `enforceOrder` | `true` | Require tasks to be completed in definition order. |
-| `requiredTasks` | `["*"]` | Tasks that must be completed before the agent can exit. `["*"]` = all, `null` = none, or a list of task names. |
-| `maxNudges` | `3` | Max times the agent is nudged to complete required tasks before being allowed to exit. |
+| `global_tools` | `[]` | Tools available in every task. |
+| `enforce_order` | `True` | Require tasks to be completed in definition order. |
+| `required_tasks` | `["*"]` | Tasks that must be completed before the agent can exit. `["*"]` = all, `None` = none, or a list of task names. |
+| `max_nudges` | `3` | Max times the agent is nudged to complete required tasks before being allowed to exit. |
 
 ### Task fields
 
@@ -273,9 +254,27 @@ class ThreatsMiddleware extends TaskMiddleware {
 | `tools` | yes | Tools visible when this task is `IN_PROGRESS`. |
 | `middleware` | no | Scoped `TaskMiddleware` — only active during this task. |
 
-## Development
+## Composability
 
-### Python
+`TaskSteeringMiddleware` is a standard `AgentMiddleware`. It composes with other LangChain v1 middleware:
+
+```python
+from langchain.agents import create_agent
+from langchain.agents.middleware import SummarizationMiddleware
+
+agent = create_agent(
+    model="anthropic:claude-sonnet-4-6",
+    middleware=[
+        SummarizationMiddleware(
+            model="anthropic:claude-haiku-4-5-20251001",
+            trigger={"tokens": 8000},
+        ),
+        pipeline,
+    ],
+)
+```
+
+## Development
 
 ```bash
 cd packages/python
@@ -284,49 +283,6 @@ pytest
 pytest --cov=langchain_task_steering
 ```
 
-### TypeScript
-
-```bash
-cd packages/typescript
-npm install
-npm test
-npm run build
-```
-
-## Project structure
-
-```
-langchain-task-steering/
-  packages/
-    python/
-      src/langchain_task_steering/
-        __init__.py          # Public exports
-        types.py             # Task, TaskMiddleware, TaskStatus, TaskSteeringState
-        middleware.py         # TaskSteeringMiddleware implementation
-      tests/
-        conftest.py          # Fixtures and mock objects
-        test_middleware.py    # Test suite
-      examples/
-        simple_agent.py      # End-to-end example with Bedrock
-      pyproject.toml
-    typescript/
-      src/
-        index.ts             # Public exports
-        types.ts             # Task, TaskMiddleware, TaskStatus, interfaces
-        middleware.ts         # TaskSteeringMiddleware implementation
-      tests/
-        middleware.test.ts   # Test suite
-      examples/
-        simple-agent.ts      # Example usage
-      package.json
-      tsconfig.json
-  .github/
-    workflows/
-      publish.yml            # PyPI + npm publish on release
-  LICENSE
-  README.md
-```
-
 ## License
 
-MIT — see [LICENSE](LICENSE).
+MIT — see [LICENSE](../../LICENSE).

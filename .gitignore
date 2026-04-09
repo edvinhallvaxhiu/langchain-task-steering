@@ -3,7 +3,6 @@ __pycache__/
 *.py[cod]
 *$py.class
 *.egg-info/
-dist/
 build/
 *.egg
 
@@ -17,6 +16,13 @@ env/
 .coverage
 htmlcov/
 
+# Node.js
+node_modules/
+*.tsbuildinfo
+
+# Build output
+dist/
+
 # IDE
 .idea/
 .vscode/
@@ -29,5 +35,3 @@ Thumbs.db
 
 # Archives
 *.zip
-
-dist/

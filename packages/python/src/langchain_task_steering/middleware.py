@@ -121,7 +121,8 @@ class TaskSteeringMiddleware(AgentMiddleware[TaskSteeringState]):
 
         statuses = self._get_statuses(state)
         incomplete = [
-            name for name in self._task_order
+            name
+            for name in self._task_order
             if name in self._required_tasks
             and statuses[name] != TaskStatus.COMPLETE.value
         ]

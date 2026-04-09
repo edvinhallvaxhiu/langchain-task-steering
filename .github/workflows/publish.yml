@@ -1,16 +1,25 @@
-name: Publish to Pypi
+name: Publish
+
+# Create any release (e.g. tag v0.2.0) and both jobs run.
+# Each job checks if its package version is already on the registry.
+# If yes, it skips. If no, it publishes.
+#
+# Workflow:
+#   1. Bump version in pyproject.toml and/or package.json
+#   2. Commit and push
+#   3. Create a GitHub release (any tag)
+#   4. Only the package(s) with a new version get published
 
 on:
   release:
     types: [published]
 
-permissions:
-  id-token: write
-
 jobs:
-  publish:
+  publish-pypi:
     runs-on: ubuntu-latest
     environment: pypi
+    permissions:
+      id-token: write
     steps:
       - uses: actions/checkout@v4
 
@@ -18,10 +27,71 @@ jobs:
         with:
           python-version: "3.12"
 
+      - name: Check if version exists on PyPI
+        id: check
+        working-directory: packages/python
+        run: |
+          VERSION=$(python -c "import tomllib; print(tomllib.load(open('pyproject.toml','rb'))['project']['version'])")
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+          if pip index versions langchain-task-steering 2>/dev/null | grep -q "$VERSION"; then
+            echo "exists=true" >> "$GITHUB_OUTPUT"
+            echo "Python $VERSION already on PyPI — skipping"
+          else
+            echo "exists=false" >> "$GITHUB_OUTPUT"
+            echo "Python $VERSION not on PyPI — will publish"
+          fi
+
       - name: Build package
+        if: steps.check.outputs.exists == 'false'
+        working-directory: packages/python
         run: |
           pip install build
           python -m build
-      
-      - name: Publish to Pypi
+
+      - name: Publish to PyPI
+        if: steps.check.outputs.exists == 'false'
         uses: pypa/gh-action-pypi-publish@release/v1
+        with:
+          packages-dir: packages/python/dist/
+
+  publish-npm:
+    runs-on: ubuntu-latest
+    environment: npm
+    permissions:
+      id-token: write
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+          registry-url: "https://registry.npmjs.org"
+
+      - name: Check if version exists on npm
+        id: check
+        working-directory: packages/typescript
+        run: |
+          VERSION=$(node -p "require('./package.json').version")
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+          if npm view @ehallvaxhiu/langchain-task-steering@"$VERSION" version 2>/dev/null; then
+            echo "exists=true" >> "$GITHUB_OUTPUT"
+            echo "TypeScript $VERSION already on npm — skipping"
+          else
+            echo "exists=false" >> "$GITHUB_OUTPUT"
+            echo "TypeScript $VERSION not on npm — will publish"
+          fi
+
+      - name: Install dependencies
+        if: steps.check.outputs.exists == 'false'
+        working-directory: packages/typescript
+        run: npm ci
+
+      - name: Build
+        if: steps.check.outputs.exists == 'false'
+        working-directory: packages/typescript
+        run: npm run build
+
+      - name: Publish to npm
+        if: steps.check.outputs.exists == 'false'
+        working-directory: packages/typescript
+        run: npm publish --access public
