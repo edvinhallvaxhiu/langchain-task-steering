@@ -636,6 +636,49 @@ export class TaskSteeringMiddleware {
       lines.push('  </rules>')
     }
 
+    if (hasVisibleSkills) {
+      lines.push('')
+      lines.push('  <skill_usage>')
+      lines.push('    **How to Use Skills (Progressive Disclosure):**')
+      lines.push('')
+      lines.push(
+        '    Skills follow a progressive disclosure pattern - you see' +
+          ' their name and description above, but only read full' +
+          ' instructions when needed:'
+      )
+      lines.push('')
+      lines.push(
+        '    1. **Recognize when a skill applies**: Check if the' +
+          " user's task matches a skill's description"
+      )
+      lines.push(
+        "    2. **Read the skill's full instructions**: Use the path" +
+          ' shown in the skill list above'
+      )
+      lines.push(
+        "    3. **Follow the skill's instructions**: SKILL.md" +
+          ' contains step-by-step workflows, best practices, and' +
+          ' examples'
+      )
+      lines.push(
+        '    4. **Access supporting files**: Skills may include' +
+          ' helper scripts, configs, or reference docs - use absolute' +
+          ' paths'
+      )
+      lines.push('')
+      lines.push('    **When to Use Skills:**')
+      lines.push("    - User's request matches a skill's domain")
+      lines.push('    - You need specialized knowledge or structured workflows')
+      lines.push('    - A skill provides proven patterns for complex tasks')
+      lines.push('')
+      lines.push('    **Executing Skill Scripts:**')
+      lines.push(
+        '    Skills may contain Python scripts or other executable' +
+          ' files. Always use absolute paths from the skill list.'
+      )
+      lines.push('  </skill_usage>')
+    }
+
     lines.push('</task_pipeline>')
     return lines.join('\n')
   }

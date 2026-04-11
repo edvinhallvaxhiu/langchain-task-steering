@@ -837,6 +837,48 @@ class TaskSteeringMiddleware(AgentMiddleware[TaskSteeringState]):
                 )
             lines.append("  </rules>")
 
+        if has_visible_skills:
+            lines.append("")
+            lines.append("  <skill_usage>")
+            lines.append("    **How to Use Skills (Progressive Disclosure):**")
+            lines.append("")
+            lines.append(
+                "    Skills follow a progressive disclosure pattern - you see"
+                " their name and description above, but only read full"
+                " instructions when needed:"
+            )
+            lines.append("")
+            lines.append(
+                "    1. **Recognize when a skill applies**: Check if the"
+                " user's task matches a skill's description"
+            )
+            lines.append(
+                "    2. **Read the skill's full instructions**: Use the path"
+                " shown in the skill list above"
+            )
+            lines.append(
+                "    3. **Follow the skill's instructions**: SKILL.md"
+                " contains step-by-step workflows, best practices, and"
+                " examples"
+            )
+            lines.append(
+                "    4. **Access supporting files**: Skills may include"
+                " helper scripts, configs, or reference docs - use absolute"
+                " paths"
+            )
+            lines.append("")
+            lines.append("    **When to Use Skills:**")
+            lines.append("    - User's request matches a skill's domain")
+            lines.append("    - You need specialized knowledge or structured workflows")
+            lines.append("    - A skill provides proven patterns for complex tasks")
+            lines.append("")
+            lines.append("    **Executing Skill Scripts:**")
+            lines.append(
+                "    Skills may contain Python scripts or other executable"
+                " files. Always use absolute paths from the skill list."
+            )
+            lines.append("  </skill_usage>")
+
         lines.append("</task_pipeline>")
         return "\n".join(lines)
 

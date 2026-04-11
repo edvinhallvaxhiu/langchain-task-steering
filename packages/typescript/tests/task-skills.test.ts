@@ -261,7 +261,11 @@ describe('Skill rendering', () => {
       taskStatuses: { research: 'in_progress', write: 'pending' },
       skillsMetadata: [
         // "web-research" and "formatting" are referenced but only "formatting" exists
-        { name: 'formatting', description: 'Format documents.', path: '/skills/formatting/SKILL.md' },
+        {
+          name: 'formatting',
+          description: 'Format documents.',
+          path: '/skills/formatting/SKILL.md',
+        },
       ],
     }
     const statuses = (mw as any)._getStatuses(state) as Record<string, string>

@@ -205,7 +205,9 @@ class TestSkillRendering:
             ],
         }
         statuses = mw._get_statuses(state)
-        with caplog.at_level(logging.WARNING, logger="langchain_task_steering.middleware"):
+        with caplog.at_level(
+            logging.WARNING, logger="langchain_task_steering.middleware"
+        ):
             mw._render_status_block(statuses, active="research", state=state)
         assert "web-research" in caplog.text
         assert "not found in skills_metadata" in caplog.text
@@ -214,7 +216,9 @@ class TestSkillRendering:
         mw = self._make_middleware()
         state = self._state_with_skills()
         statuses = mw._get_statuses(state)
-        with caplog.at_level(logging.WARNING, logger="langchain_task_steering.middleware"):
+        with caplog.at_level(
+            logging.WARNING, logger="langchain_task_steering.middleware"
+        ):
             mw._render_status_block(statuses, active="research", state=state)
         assert "not found in skills_metadata" not in caplog.text
 
