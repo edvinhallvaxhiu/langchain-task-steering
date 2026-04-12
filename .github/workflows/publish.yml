@@ -84,7 +84,7 @@ jobs:
       - name: Install dependencies
         if: steps.check.outputs.exists == 'false'
         working-directory: packages/typescript
-        run: npm ci
+        run: npm install
 
       - name: Build
         if: steps.check.outputs.exists == 'false'

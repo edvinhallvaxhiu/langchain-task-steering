@@ -9,7 +9,7 @@ from typing import Annotated, Any
 
 from langchain.agents.middleware import AgentMiddleware, ModelRequest, ModelResponse
 from langchain.agents.middleware import hook_config
-from langchain.messages import HumanMessage, SystemMessage, ToolMessage
+from langchain.messages import AIMessage, HumanMessage, RemoveMessage, SystemMessage, ToolMessage
 from langchain.tools import tool, ToolRuntime
 from langchain.tools.tool_node import ToolCallRequest
 from langgraph.runtime import Runtime
@@ -17,7 +17,7 @@ from langgraph.types import Command
 from typing_extensions import TypedDict
 
 from ._hooks import WRAP_HOOK_PAIRS, overrides_base
-from .types import Task, TaskMiddleware, TaskStatus, TaskSteeringState
+from .types import Task, TaskMiddleware, TaskStatus, TaskSteeringState, TaskSummarization
 
 logger = logging.getLogger(__name__)
 
@@ -30,6 +30,20 @@ def _overrides_task(middleware: TaskMiddleware, method_name: str) -> bool:
     return getattr(type(middleware), method_name) is not getattr(
         TaskMiddleware, method_name, None
     )
+
+
+def _merge_hook_updates(
+    base: dict[str, Any] | None, updates: dict[str, Any] | None
+) -> dict[str, Any] | None:
+    """Merge lifecycle hook return values, appending ``messages`` lists."""
+    if not updates:
+        return base
+    if not base:
+        return dict(updates)
+    merged = {**base, **updates}
+    if "messages" in base and "messages" in updates:
+        merged["messages"] = base["messages"] + updates["messages"]
+    return merged
 
 
 class _ComposedTaskMiddleware(TaskMiddleware):
@@ -113,14 +127,20 @@ class _ComposedTaskMiddleware(TaskMiddleware):
         return None
 
     def on_start(self, state):
+        merged = None
         for mw in self._middlewares:
             if _overrides_task(mw, "on_start"):
-                mw.on_start(state)
+                updates = mw.on_start(state)
+                merged = _merge_hook_updates(merged, updates)
+        return merged
 
     def on_complete(self, state):
+        merged = None
         for mw in self._middlewares:
             if _overrides_task(mw, "on_complete"):
-                mw.on_complete(state)
+                updates = mw.on_complete(state)
+                merged = _merge_hook_updates(merged, updates)
+        return merged
 
     async def avalidate_completion(self, state):
         for mw in self._middlewares:
@@ -133,16 +153,22 @@ class _ComposedTaskMiddleware(TaskMiddleware):
         return None
 
     async def aon_start(self, state):
+        merged = None
         for mw in self._middlewares:
             if _overrides_task(mw, "aon_start") or _overrides_task(mw, "on_start"):
-                await mw.aon_start(state)
+                updates = await mw.aon_start(state)
+                merged = _merge_hook_updates(merged, updates)
+        return merged
 
     async def aon_complete(self, state):
+        merged = None
         for mw in self._middlewares:
             if _overrides_task(mw, "aon_complete") or _overrides_task(
                 mw, "on_complete"
             ):
-                await mw.aon_complete(state)
+                updates = await mw.aon_complete(state)
+                merged = _merge_hook_updates(merged, updates)
+        return merged
 
 
 def _is_valid_middleware(mw: Any) -> bool:
@@ -226,6 +252,9 @@ class TaskSteeringMiddleware(AgentMiddleware[TaskSteeringState]):
         backend_tools: Override the default backend tools whitelist.
             ``None`` uses :attr:`DEFAULT_BACKEND_TOOLS`.
         global_skills: Skill names available regardless of active task.
+        model: Default chat model for ``TaskSummarization(mode="summarize")``.
+            Used when a task's ``summarize.model`` is ``None``.  Typically
+            the same model passed to ``create_agent``.
     """
 
     DEFAULT_BACKEND_TOOLS: frozenset[str] = frozenset(
@@ -263,6 +292,7 @@ class TaskSteeringMiddleware(AgentMiddleware[TaskSteeringState]):
         backend_tools_passthrough: bool = False,
         backend_tools: set[str] | None = None,
         global_skills: list[str] | None = None,
+        model: Any = None,
     ) -> None:
         super().__init__()
         if not tasks:
@@ -285,6 +315,7 @@ class TaskSteeringMiddleware(AgentMiddleware[TaskSteeringState]):
         self._global_tools: list = global_tools or []
         self._enforce_order = enforce_order
         self._max_nudges = max_nudges
+        self._model = model
 
         # ── Backend tools passthrough ────────────────────────────
         self._backend_tools = (
@@ -493,28 +524,38 @@ class TaskSteeringMiddleware(AgentMiddleware[TaskSteeringState]):
         request: ToolCallRequest,
         result: ToolMessage | Command,
         statuses: dict[str, str],
-    ) -> None:
-        """Fire on_start/on_complete if the transition succeeded."""
+    ) -> ToolMessage | Command:
+        """Fire on_start/on_complete and merge returned updates into the Command."""
         args = request.tool_call["args"]
         task_name = args.get("task")
         target = args.get("status")
 
         if not isinstance(result, Command) or task_name not in self._task_map:
-            return
+            return result
 
         task_mw = self._get_task_middleware(task_name)
-        if not task_mw:
-            return
 
-        # Build post-transition state so hooks see the updated task_statuses
-        # (the Command hasn't been applied yet).
-        updated_statuses = {**statuses, task_name: target}
-        post_state = {**request.state, "task_statuses": updated_statuses}
+        if task_mw:
+            updated_statuses = {**statuses, task_name: target}
+            post_state = {**request.state, "task_statuses": updated_statuses}
+
+            if target == TaskStatus.IN_PROGRESS.value:
+                updates = task_mw.on_start(post_state)
+            elif target == TaskStatus.COMPLETE.value:
+                updates = task_mw.on_complete(post_state)
+            else:
+                updates = None
+
+            merged = _merge_hook_updates(dict(result.update), updates)
+            if merged is not None and merged is not result.update:
+                result = Command(update=merged)
 
         if target == TaskStatus.IN_PROGRESS.value:
-            task_mw.on_start(post_state)
+            result = self._record_task_start(result, request.state, task_name)
         elif target == TaskStatus.COMPLETE.value:
-            task_mw.on_complete(post_state)
+            result = self._apply_summarization(result, request.state, task_name)
+
+        return result
 
     async def _avalidate_transition(
         self, request: ToolCallRequest, statuses: dict[str, str]
@@ -557,26 +598,38 @@ class TaskSteeringMiddleware(AgentMiddleware[TaskSteeringState]):
         request: ToolCallRequest,
         result: ToolMessage | Command,
         statuses: dict[str, str],
-    ) -> None:
+    ) -> ToolMessage | Command:
         """Async version of _fire_lifecycle_hooks."""
         args = request.tool_call["args"]
         task_name = args.get("task")
         target = args.get("status")
 
         if not isinstance(result, Command) or task_name not in self._task_map:
-            return
+            return result
 
         task_mw = self._get_task_middleware(task_name)
-        if not task_mw:
-            return
 
-        updated_statuses = {**statuses, task_name: target}
-        post_state = {**request.state, "task_statuses": updated_statuses}
+        if task_mw:
+            updated_statuses = {**statuses, task_name: target}
+            post_state = {**request.state, "task_statuses": updated_statuses}
+
+            if target == TaskStatus.IN_PROGRESS.value:
+                updates = await task_mw.aon_start(post_state)
+            elif target == TaskStatus.COMPLETE.value:
+                updates = await task_mw.aon_complete(post_state)
+            else:
+                updates = None
+
+            merged = _merge_hook_updates(dict(result.update), updates)
+            if merged is not None and merged is not result.update:
+                result = Command(update=merged)
 
         if target == TaskStatus.IN_PROGRESS.value:
-            await task_mw.aon_start(post_state)
+            result = self._record_task_start(result, request.state, task_name)
         elif target == TaskStatus.COMPLETE.value:
-            await task_mw.aon_complete(post_state)
+            result = await self._aapply_summarization(result, request.state, task_name)
+
+        return result
 
     def _gate_tool(
         self, request: ToolCallRequest, active_name: str | None
@@ -622,8 +675,7 @@ class TaskSteeringMiddleware(AgentMiddleware[TaskSteeringState]):
                 return rejection
 
             result = handler(request)
-            self._fire_lifecycle_hooks(request, result, statuses)
-            return result
+            return self._fire_lifecycle_hooks(request, result, statuses)
 
         gate = self._gate_tool(request, active_name)
         if gate:
@@ -666,8 +718,7 @@ class TaskSteeringMiddleware(AgentMiddleware[TaskSteeringState]):
                 return rejection
 
             result = await handler(request)
-            await self._afire_lifecycle_hooks(request, result, statuses)
-            return result
+            return await self._afire_lifecycle_hooks(request, result, statuses)
 
         gate = self._gate_tool(request, active_name)
         if gate:
@@ -881,6 +932,176 @@ class TaskSteeringMiddleware(AgentMiddleware[TaskSteeringState]):
 
         lines.append("</task_pipeline>")
         return "\n".join(lines)
+
+    def _record_task_start(
+        self, result: Command, state: dict, task_name: str
+    ) -> Command:
+        """Inject ``task_message_starts[task_name]`` into the Command update."""
+        task = self._task_map[task_name]
+        if task.summarize is None:
+            return result
+
+        start_index = len(state.get("messages", [])) + 1
+        update = dict(result.update) if result.update else {}
+        starts = dict(state.get("task_message_starts") or {})
+        starts[task_name] = start_index
+        update["task_message_starts"] = starts
+        return Command(update=update)
+
+    def _prepare_summarization(
+        self, state: dict, task_name: str
+    ) -> tuple[Task, TaskSummarization, list, list, Any] | None:
+        """Shared setup for sync/async summarization.
+
+        Returns ``(task, cfg, task_messages, remove_ops, model)``
+        or ``None`` if summarization should be skipped.
+
+        Task messages are those *between* the in_progress transition and
+        the complete-transition AIMessage (which stays untouched).  The
+        summary text is injected into the transition ``ToolMessage``
+        instead of creating a replacement ``AIMessage``.
+        """
+        task = self._task_map[task_name]
+        if task.summarize is None:
+            return None
+
+        messages = state.get("messages", [])
+        starts = state.get("task_message_starts") or {}
+        start_index = starts.get(task_name)
+        if start_index is None:
+            return None
+
+        # Exclude the complete-transition AIMessage (last element).
+        task_messages = messages[start_index : len(messages) - 1]
+        if not task_messages:
+            return None
+
+        cfg = task.summarize
+        model = cfg.model or self._model
+
+        if cfg.mode == "replace":
+            remove_ops = [
+                RemoveMessage(id=m.id) for m in task_messages
+                if getattr(m, "id", None)
+            ]
+        else:
+            if model is None:
+                logger.warning(
+                    "Skipping summarization for task '%s': no model configured. "
+                    "Set model on TaskSummarization or TaskSteeringMiddleware.",
+                    task_name,
+                )
+                return None
+            remove_ops = [
+                RemoveMessage(id=m.id)
+                for m in task_messages
+                if isinstance(m, (AIMessage, ToolMessage)) and getattr(m, "id", None)
+            ]
+
+        return task, cfg, task_messages, remove_ops, model
+
+    def _finalize_summarization(
+        self,
+        result: Command,
+        state: dict,
+        task_name: str,
+        cfg: TaskSummarization,
+        remove_ops: list,
+        summary: str,
+    ) -> Command:
+        """Inject remove ops and rewrite the transition ToolMessage with the summary."""
+        update = dict(result.update) if result.update else {}
+        existing_msgs = list(update.get("messages", []))
+
+        for i, msg in enumerate(existing_msgs):
+            if isinstance(msg, ToolMessage):
+                existing_msgs[i] = ToolMessage(
+                    content=f"{msg.content}\n\nTask summary:\n{summary}",
+                    tool_call_id=msg.tool_call_id,
+                )
+                break
+
+        # Strip text from the complete-transition AIMessage, keeping only tool_calls
+        trim_ops: list = []
+        if cfg.trim_complete_message:
+            messages = state.get("messages", [])
+            if messages:
+                complete_ai = messages[-1]
+                if isinstance(complete_ai, AIMessage) and getattr(complete_ai, "id", None):
+                    trim_ops = [AIMessage(
+                        content="",
+                        id=complete_ai.id,
+                        tool_calls=getattr(complete_ai, "tool_calls", []),
+                    )]
+
+        update["messages"] = [*remove_ops, *trim_ops, *existing_msgs]
+
+        starts = dict(state.get("task_message_starts") or {})
+        starts.pop(task_name, None)
+        update["task_message_starts"] = starts
+
+        return Command(update=update)
+
+    def _apply_summarization(
+        self, result: Command, state: dict, task_name: str
+    ) -> Command:
+        """Replace task messages with a summary injected into the transition ToolMessage."""
+        prep = self._prepare_summarization(state, task_name)
+        if prep is None:
+            return result
+
+        task, cfg, task_messages, remove_ops, model = prep
+
+        if cfg.mode == "replace":
+            summary = cfg.content
+        else:
+            system, human = self._build_summary_prompt(task, cfg)
+            response = model.invoke([system, *task_messages, human])
+            summary = response.content
+
+        return self._finalize_summarization(
+            result, state, task_name, cfg, remove_ops, summary
+        )
+
+    async def _aapply_summarization(
+        self, result: Command, state: dict, task_name: str
+    ) -> Command:
+        """Async version of ``_apply_summarization``."""
+        prep = self._prepare_summarization(state, task_name)
+        if prep is None:
+            return result
+
+        task, cfg, task_messages, remove_ops, model = prep
+
+        if cfg.mode == "replace":
+            summary = cfg.content
+        else:
+            system, human = self._build_summary_prompt(task, cfg)
+            response = await model.ainvoke([system, *task_messages, human])
+            summary = response.content
+
+        return self._finalize_summarization(
+            result, state, task_name, cfg, remove_ops, summary
+        )
+
+    @staticmethod
+    def _build_summary_prompt(
+        task: Task, cfg: TaskSummarization
+    ) -> tuple[SystemMessage, HumanMessage]:
+        """Build the system + human messages for the summarization LLM call."""
+        system = SystemMessage(
+            content=(
+                "You are summarizing a completed agent task.\n\n"
+                f"Task name: {task.name}\n"
+                f"Task instruction: {task.instruction}"
+            )
+        )
+        human = HumanMessage(
+            content=cfg.prompt
+            if cfg.prompt is not None
+            else "Provide a concise summary of what was accomplished."
+        )
+        return system, human
 
     def _build_transition_tool(self):
         """Build the update_task_status tool with closure over pipeline config."""

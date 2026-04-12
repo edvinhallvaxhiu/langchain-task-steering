@@ -2130,3 +2130,245 @@ describe('async lifecycle hooks', () => {
     expect((result as ToolMessageResult).content).toContain('already in progress')
   })
 })
+
+// ════════════════════════════════════════════════════════════
+// Lifecycle hook state updates (onStart / onComplete return values)
+// ════════════════════════════════════════════════════════════
+
+describe('Lifecycle hook state updates', () => {
+  it('onStart return merged into CommandResult', () => {
+    class InjectMeta extends TaskMiddleware {
+      onStart(_state: Record<string, unknown>) {
+        return { meta: 'started' }
+      }
+    }
+
+    const tasks: Task[] = [{ name: 'a', instruction: 'A', tools: [], middleware: new InjectMeta() }]
+    const mw = new TaskSteeringMiddleware({ tasks })
+
+    const request = mockToolCallRequest({
+      toolCall: { name: 'update_task_status', args: { task: 'a', status: 'in_progress' }, id: 'call-1' },
+      state: { taskStatuses: { a: 'pending' } },
+    })
+
+    const handler = vi.fn(() => ({
+      update: { taskStatuses: { a: 'in_progress' }, messages: [{ role: 'tool', content: 'ok', toolCallId: 'call-1' }] },
+    }))
+    const result = mw.wrapToolCall(request, handler) as CommandResult
+    expect(result.update.meta).toBe('started')
+    expect(result.update.taskStatuses).toEqual({ a: 'in_progress' })
+  })
+
+  it('onComplete return merged into CommandResult', () => {
+    class InjectSummary extends TaskMiddleware {
+      onComplete(_state: Record<string, unknown>) {
+        return { summary: 'done' }
+      }
+    }
+
+    const tasks: Task[] = [
+      { name: 'a', instruction: 'A', tools: [], middleware: new InjectSummary() },
+    ]
+    const mw = new TaskSteeringMiddleware({ tasks })
+
+    const request = mockToolCallRequest({
+      toolCall: { name: 'update_task_status', args: { task: 'a', status: 'complete' }, id: 'call-1' },
+      state: { taskStatuses: { a: 'in_progress' } },
+    })
+
+    const handler = vi.fn(() => ({
+      update: { taskStatuses: { a: 'complete' }, messages: [{ role: 'tool', content: 'ok', toolCallId: 'call-1' }] },
+    }))
+    const result = mw.wrapToolCall(request, handler) as CommandResult
+    expect(result.update.summary).toBe('done')
+  })
+
+  it('messages appended not overwritten', () => {
+    const originalMsg = { role: 'tool', content: 'transition', toolCallId: 'call-1' }
+    const extraMsg = { role: 'tool', content: 'extra', toolCallId: 'extra-1' }
+
+    class AppendMessages extends TaskMiddleware {
+      onComplete(_state: Record<string, unknown>) {
+        return { messages: [extraMsg] }
+      }
+    }
+
+    const tasks: Task[] = [
+      { name: 'a', instruction: 'A', tools: [], middleware: new AppendMessages() },
+    ]
+    const mw = new TaskSteeringMiddleware({ tasks })
+
+    const request = mockToolCallRequest({
+      toolCall: { name: 'update_task_status', args: { task: 'a', status: 'complete' }, id: 'call-1' },
+      state: { taskStatuses: { a: 'in_progress' } },
+    })
+
+    const handler = vi.fn(() => ({ update: { messages: [originalMsg] } }))
+    const result = mw.wrapToolCall(request, handler) as CommandResult
+    const msgs = result.update.messages as unknown[]
+    expect(msgs).toHaveLength(2)
+    expect(msgs[0]).toBe(originalMsg)
+    expect(msgs[1]).toBe(extraMsg)
+  })
+
+  it('void return is noop', () => {
+    class NoopHook extends TaskMiddleware {
+      onStart(_state: Record<string, unknown>) {
+        // no return — void
+      }
+    }
+
+    const tasks: Task[] = [{ name: 'a', instruction: 'A', tools: [], middleware: new NoopHook() }]
+    const mw = new TaskSteeringMiddleware({ tasks })
+
+    const request = mockToolCallRequest({
+      toolCall: { name: 'update_task_status', args: { task: 'a', status: 'in_progress' }, id: 'call-1' },
+      state: { taskStatuses: { a: 'pending' } },
+    })
+
+    const originalUpdate = {
+      taskStatuses: { a: 'in_progress' },
+      messages: [{ role: 'tool', content: 'ok', toolCallId: 'call-1' }],
+    }
+    const handler = vi.fn(() => ({ update: { ...originalUpdate } }))
+    const result = mw.wrapToolCall(request, handler) as CommandResult
+    expect(result.update).toEqual(originalUpdate)
+  })
+
+  it('composed middleware merges all returns', () => {
+    class Hook1 extends TaskMiddleware {
+      onStart(_state: Record<string, unknown>) {
+        return { a: 1, messages: [{ role: 'tool', content: 'h1', toolCallId: 'h1' }] }
+      }
+    }
+
+    class Hook2 extends TaskMiddleware {
+      onStart(_state: Record<string, unknown>) {
+        return { b: 2, messages: [{ role: 'tool', content: 'h2', toolCallId: 'h2' }] }
+      }
+    }
+
+    const originalMsg = { role: 'tool', content: 'transition', toolCallId: 'call-1' }
+    const tasks: Task[] = [
+      { name: 'a', instruction: 'A', tools: [], middleware: [new Hook1(), new Hook2()] },
+    ]
+    const mw = new TaskSteeringMiddleware({ tasks })
+
+    const request = mockToolCallRequest({
+      toolCall: { name: 'update_task_status', args: { task: 'a', status: 'in_progress' }, id: 'call-1' },
+      state: { taskStatuses: { a: 'pending' } },
+    })
+
+    const handler = vi.fn(() => ({ update: { messages: [originalMsg] } }))
+    const result = mw.wrapToolCall(request, handler) as CommandResult
+    expect(result.update.a).toBe(1)
+    expect(result.update.b).toBe(2)
+    const msgs = result.update.messages as unknown[]
+    expect(msgs).toHaveLength(3)
+    expect(msgs[0]).toBe(originalMsg)
+  })
+
+  it('composed void and dict mixed', () => {
+    class ReturnsVoid extends TaskMiddleware {
+      onComplete(_state: Record<string, unknown>) {
+        // no return
+      }
+    }
+
+    class ReturnsDict extends TaskMiddleware {
+      onComplete(_state: Record<string, unknown>) {
+        return { extra: true }
+      }
+    }
+
+    const tasks: Task[] = [
+      { name: 'a', instruction: 'A', tools: [], middleware: [new ReturnsVoid(), new ReturnsDict()] },
+    ]
+    const mw = new TaskSteeringMiddleware({ tasks })
+
+    const request = mockToolCallRequest({
+      toolCall: { name: 'update_task_status', args: { task: 'a', status: 'complete' }, id: 'call-1' },
+      state: { taskStatuses: { a: 'in_progress' } },
+    })
+
+    const handler = vi.fn(() => ({
+      update: { messages: [{ role: 'tool', content: 'ok', toolCallId: 'call-1' }] },
+    }))
+    const result = mw.wrapToolCall(request, handler) as CommandResult
+    expect(result.update.extra).toBe(true)
+  })
+
+  it('async onStart return merged', async () => {
+    class AsyncMeta extends TaskMiddleware {
+      async aOnStart(_state: Record<string, unknown>) {
+        return { asyncMeta: 'started' }
+      }
+    }
+
+    const tasks: Task[] = [{ name: 'a', instruction: 'A', tools: [], middleware: new AsyncMeta() }]
+    const mw = new TaskSteeringMiddleware({ tasks })
+
+    const request = mockToolCallRequest({
+      toolCall: { name: 'update_task_status', args: { task: 'a', status: 'in_progress' }, id: 'call-1' },
+      state: { taskStatuses: { a: 'pending' } },
+    })
+
+    const result = await mw.awrapToolCall(request, async () => ({
+      update: {
+        taskStatuses: { a: 'in_progress' },
+        messages: [{ role: 'tool', content: 'ok', toolCallId: 'call-1' }],
+      },
+    }))
+    expect((result as CommandResult).update.asyncMeta).toBe('started')
+  })
+
+  it('async onComplete messages appended', async () => {
+    const extraMsg = { role: 'tool', content: 'async-extra', toolCallId: 'extra-1' }
+    const originalMsg = { role: 'tool', content: 'transition', toolCallId: 'call-1' }
+
+    class AsyncAppend extends TaskMiddleware {
+      async aOnComplete(_state: Record<string, unknown>) {
+        return { messages: [extraMsg] }
+      }
+    }
+
+    const tasks: Task[] = [{ name: 'a', instruction: 'A', tools: [], middleware: new AsyncAppend() }]
+    const mw = new TaskSteeringMiddleware({ tasks })
+
+    const request = mockToolCallRequest({
+      toolCall: { name: 'update_task_status', args: { task: 'a', status: 'complete' }, id: 'call-1' },
+      state: { taskStatuses: { a: 'in_progress' } },
+    })
+
+    const result = await mw.awrapToolCall(request, async () => ({
+      update: { messages: [originalMsg] },
+    }))
+    const msgs = (result as CommandResult).update.messages as unknown[]
+    expect(msgs).toHaveLength(2)
+    expect(msgs[0]).toBe(originalMsg)
+    expect(msgs[1]).toBe(extraMsg)
+  })
+
+  it('sync hook return works in async path via delegation', async () => {
+    class SyncReturnsDict extends TaskMiddleware {
+      onStart(_state: Record<string, unknown>) {
+        return { fromSync: true }
+      }
+    }
+
+    const tasks: Task[] = [
+      { name: 'a', instruction: 'A', tools: [], middleware: new SyncReturnsDict() },
+    ]
+    const mw = new TaskSteeringMiddleware({ tasks })
+
+    const request = mockToolCallRequest({
+      toolCall: { name: 'update_task_status', args: { task: 'a', status: 'in_progress' }, id: 'call-1' },
+      state: { taskStatuses: { a: 'pending' } },
+    })
+
+    const result = await mw.awrapToolCall(request, async () => ({
+      update: { messages: [{ role: 'tool', content: 'ok', toolCallId: 'call-1' }] },
+    }))
+    expect((result as CommandResult).update.fromSync).toBe(true)
+  })
+})

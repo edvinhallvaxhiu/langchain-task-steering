@@ -156,8 +156,9 @@ class TestSkillRendering:
         assert "<available_skills>" in block
         assert "web-research" in block
         assert "formatting" in block
-        # "other" is not in research's skills or global_skills
-        assert "other" not in block
+        # "other" skill should not appear in available_skills
+        assert "other:" not in block
+        assert "/skills/other/" not in block
 
     def test_no_skills_section_when_inactive(self):
         tasks = [Task(name="a", instruction="A", tools=[tool_a])]

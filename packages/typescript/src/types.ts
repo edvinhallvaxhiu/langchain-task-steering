@@ -113,20 +113,32 @@ export class TaskMiddleware {
   /**
    * Called after the task transitions to in_progress.
    *
-   * Note: `state` contains the *projected* post-transition
-   * `taskStatuses` but all other fields reflect the pre-transition
-   * snapshot (the Command has not been applied to the graph yet).
-   */
-  onStart(_state: Record<string, unknown>): void {}
-
-  /**
-   * Called after the task transitions to complete (after validation).
+   * Optionally return a record of state updates to merge into the
+   * transition Command. If `messages` appears in both the returned
+   * record and the existing Command update, the arrays are **appended**
+   * (not overwritten) so the transition ToolMessage is preserved.
+   * Return `undefined` / `void` (default) for no state changes.
    *
    * Note: `state` contains the *projected* post-transition
    * `taskStatuses` but all other fields reflect the pre-transition
    * snapshot (the Command has not been applied to the graph yet).
    */
-  onComplete(_state: Record<string, unknown>): void {}
+  onStart(_state: Record<string, unknown>): Record<string, unknown> | void {}
+
+  /**
+   * Called after the task transitions to complete (after validation).
+   *
+   * Optionally return a record of state updates to merge into the
+   * transition Command. If `messages` appears in both the returned
+   * record and the existing Command update, the arrays are **appended**
+   * (not overwritten) so the transition ToolMessage is preserved.
+   * Return `undefined` / `void` (default) for no state changes.
+   *
+   * Note: `state` contains the *projected* post-transition
+   * `taskStatuses` but all other fields reflect the pre-transition
+   * snapshot (the Command has not been applied to the graph yet).
+   */
+  onComplete(_state: Record<string, unknown>): Record<string, unknown> | void {}
 
   /**
    * Async version of `validateCompletion`.
@@ -139,15 +151,15 @@ export class TaskMiddleware {
   /**
    * Async version of `onStart`. Default delegates to sync.
    */
-  async aOnStart(state: Record<string, unknown>): Promise<void> {
-    this.onStart(state)
+  async aOnStart(state: Record<string, unknown>): Promise<Record<string, unknown> | void> {
+    return this.onStart(state)
   }
 
   /**
    * Async version of `onComplete`. Default delegates to sync.
    */
-  async aOnComplete(state: Record<string, unknown>): Promise<void> {
-    this.onComplete(state)
+  async aOnComplete(state: Record<string, unknown>): Promise<Record<string, unknown> | void> {
+    return this.onComplete(state)
   }
 
   wrapToolCall?(

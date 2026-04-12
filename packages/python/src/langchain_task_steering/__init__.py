@@ -1,6 +1,6 @@
 from .adapter import AgentMiddlewareAdapter
 from .middleware import TaskSteeringMiddleware
-from .types import Task, TaskMiddleware, TaskStatus, TaskSteeringState, SkillMetadata
+from .types import Task, TaskMiddleware, TaskStatus, TaskSteeringState, SkillMetadata, TaskSummarization
 
 __all__ = [
     "AgentMiddlewareAdapter",
@@ -10,4 +10,5 @@ __all__ = [
     "TaskStatus",
     "TaskSteeringMiddleware",
     "TaskSteeringState",
+    "TaskSummarization",
 ]

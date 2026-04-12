@@ -316,6 +316,7 @@ export class TaskSteeringMiddleware {
   /**
    * Fire sync lifecycle hooks after a successful transition.
    * Build post-transition state so hooks see the updated taskStatuses.
+   * Merges any returned state updates into the CommandResult.
    */
   private _fireLifecycleHooks(
     request: ToolCallRequest,
@@ -329,10 +330,23 @@ export class TaskSteeringMiddleware {
     if (!taskMw) return
     const updatedStatuses = { ...statuses, [taskName]: target }
     const postState = { ...request.state, taskStatuses: updatedStatuses }
+
+    let updates: Record<string, unknown> | void = undefined
     if (target === TaskStatus.IN_PROGRESS) {
-      taskMw.onStart(postState)
+      updates = taskMw.onStart(postState)
     } else if (target === TaskStatus.COMPLETE) {
-      taskMw.onComplete(postState)
+      updates = taskMw.onComplete(postState)
+    }
+
+    if (updates) {
+      const merged = { ...result.update, ...updates }
+      if ('messages' in updates && 'messages' in result.update) {
+        merged.messages = [
+          ...(result.update.messages as unknown[]),
+          ...(updates.messages as unknown[]),
+        ]
+      }
+      result.update = merged
     }
   }
 
@@ -756,16 +770,27 @@ export class TaskSteeringMiddleware {
 
       const result = await handler(request)
 
-      // Async lifecycle hooks
+      // Async lifecycle hooks — merge returned updates into the Command
       if (this._isCommand(result) && this._taskMap.has(taskName)) {
         const taskMw = this._getTaskMiddleware(taskName)
         if (taskMw) {
           const updatedStatuses = { ...statuses, [taskName]: target }
           const postState = { ...request.state, taskStatuses: updatedStatuses }
+          let updates: Record<string, unknown> | void = undefined
           if (target === TaskStatus.IN_PROGRESS) {
-            await taskMw.aOnStart(postState)
+            updates = await taskMw.aOnStart(postState)
           } else if (target === TaskStatus.COMPLETE) {
-            await taskMw.aOnComplete(postState)
+            updates = await taskMw.aOnComplete(postState)
+          }
+          if (updates) {
+            const merged = { ...result.update, ...updates }
+            if ('messages' in updates && 'messages' in result.update) {
+              merged.messages = [
+                ...(result.update.messages as unknown[]),
+                ...(updates.messages as unknown[]),
+              ]
+            }
+            result.update = merged
           }
         }
       }
@@ -793,6 +818,22 @@ function overridesMethod(mw: TaskMiddleware, method: keyof TaskMiddleware): bool
     (mw as unknown as Record<string, unknown>)[method] !==
       (TaskMiddleware.prototype as unknown as Record<string, unknown>)[method]
   )
+}
+
+/**
+ * Merge lifecycle hook return values, appending `messages` arrays.
+ */
+function mergeHookUpdates(
+  base: Record<string, unknown> | void,
+  updates: Record<string, unknown> | void
+): Record<string, unknown> | void {
+  if (!updates) return base
+  if (!base) return { ...updates }
+  const merged = { ...base, ...updates }
+  if ('messages' in base && 'messages' in updates) {
+    merged.messages = [...(base.messages as unknown[]), ...(updates.messages as unknown[])]
+  }
+  return merged
 }
 
 class ComposedTaskMiddleware extends TaskMiddleware {
@@ -858,20 +899,26 @@ class ComposedTaskMiddleware extends TaskMiddleware {
     return null
   }
 
-  onStart(state: Record<string, unknown>): void {
+  onStart(state: Record<string, unknown>): Record<string, unknown> | void {
+    let merged: Record<string, unknown> | void = undefined
     for (const mw of this._middlewares) {
       if (overridesMethod(mw, 'onStart')) {
-        mw.onStart(state)
+        const updates = mw.onStart(state)
+        merged = mergeHookUpdates(merged, updates)
       }
     }
+    return merged
   }
 
-  onComplete(state: Record<string, unknown>): void {
+  onComplete(state: Record<string, unknown>): Record<string, unknown> | void {
+    let merged: Record<string, unknown> | void = undefined
     for (const mw of this._middlewares) {
       if (overridesMethod(mw, 'onComplete')) {
-        mw.onComplete(state)
+        const updates = mw.onComplete(state)
+        merged = mergeHookUpdates(merged, updates)
       }
     }
+    return merged
   }
 
   async aValidateCompletion(state: Record<string, unknown>): Promise<string | null> {
@@ -884,20 +931,26 @@ class ComposedTaskMiddleware extends TaskMiddleware {
     return null
   }
 
-  async aOnStart(state: Record<string, unknown>): Promise<void> {
+  async aOnStart(state: Record<string, unknown>): Promise<Record<string, unknown> | void> {
+    let merged: Record<string, unknown> | void = undefined
     for (const mw of this._middlewares) {
       if (overridesMethod(mw, 'aOnStart') || overridesMethod(mw, 'onStart')) {
-        await mw.aOnStart(state)
+        const updates = await mw.aOnStart(state)
+        merged = mergeHookUpdates(merged, updates)
       }
     }
+    return merged
   }
 
-  async aOnComplete(state: Record<string, unknown>): Promise<void> {
+  async aOnComplete(state: Record<string, unknown>): Promise<Record<string, unknown> | void> {
+    let merged: Record<string, unknown> | void = undefined
     for (const mw of this._middlewares) {
       if (overridesMethod(mw, 'aOnComplete') || overridesMethod(mw, 'onComplete')) {
-        await mw.aOnComplete(state)
+        const updates = await mw.aOnComplete(state)
+        merged = mergeHookUpdates(merged, updates)
       }
     }
+    return merged
   }
 }
 
