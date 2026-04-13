@@ -1,12 +1,31 @@
 import { describe, it, expect, vi } from 'vitest'
 import {
   TaskSteeringMiddleware,
+  _getStatuses,
+  _getAllowedToolNames,
+  _getAllowedSkillNames,
+  _renderStatusBlock,
   type Task,
   type ToolLike,
   type ModelRequest,
   type SystemMessageLike,
   type SkillMetadata,
 } from '../src/index.js'
+
+function mwAllowedToolNames(
+  mw: TaskSteeringMiddleware,
+  activeName: string | null,
+  state?: Record<string, unknown>
+): Set<string> {
+  return _getAllowedToolNames(
+    mw._ctx,
+    activeName,
+    new Set(),
+    (mw as any)._backendToolsPassthrough as boolean,
+    (mw as any)._backendTools as ReadonlySet<string>,
+    state
+  )
+}
 
 // ── Mock tools ──────────────────────────────────────────────
 
@@ -86,14 +105,14 @@ describe('Skills init', () => {
     const mw = new TaskSteeringMiddleware({
       tasks: [{ name: 'a', instruction: 'A', tools: [toolA], skills: ['s1'] }],
     })
-    expect((mw as any)._skillsActive).toBe(true)
+    expect(mw._ctx.skillsActive).toBe(true)
   })
 
   it('no skills configured is inert', () => {
     const mw = new TaskSteeringMiddleware({
       tasks: [{ name: 'a', instruction: 'A', tools: [toolA] }],
     })
-    expect((mw as any)._skillsActive).toBe(false)
+    expect(mw._ctx.skillsActive).toBe(false)
   })
 
   it('globalSkills activates without backend', () => {
@@ -101,7 +120,7 @@ describe('Skills init', () => {
       tasks: [{ name: 'a', instruction: 'A', tools: [toolA] }],
       globalSkills: ['gs'],
     })
-    expect((mw as any)._skillsActive).toBe(true)
+    expect(mw._ctx.skillsActive).toBe(true)
   })
 
   it('task skills field defaults to undefined', () => {
@@ -149,7 +168,7 @@ describe('Skill scoping', () => {
       tasks: [{ name: 'a', instruction: 'A', tools: [toolA], skills: ['s1'] }],
       globalSkills: ['gs'],
     })
-    const allowed = (mw as any)._allowedSkillNames(null) as Set<string>
+    const allowed = _getAllowedSkillNames(mw._ctx, null) as Set<string>
     expect(allowed).toEqual(new Set(['gs']))
   })
 
@@ -158,7 +177,7 @@ describe('Skill scoping', () => {
       tasks: [{ name: 'a', instruction: 'A', tools: [toolA], skills: ['s1', 's2'] }],
       globalSkills: ['gs'],
     })
-    const allowed = (mw as any)._allowedSkillNames('a') as Set<string>
+    const allowed = _getAllowedSkillNames(mw._ctx, 'a') as Set<string>
     expect(allowed).toEqual(new Set(['gs', 's1', 's2']))
   })
 
@@ -170,7 +189,7 @@ describe('Skill scoping', () => {
       ],
       globalSkills: ['gs'],
     })
-    const allowed = (mw as any)._allowedSkillNames('b') as Set<string>
+    const allowed = _getAllowedSkillNames(mw._ctx, 'b') as Set<string>
     expect(allowed).toEqual(new Set(['gs']))
   })
 })
@@ -213,19 +232,22 @@ describe('Skill rendering', () => {
   it('renders available_skills section', () => {
     const mw = makeMiddleware()
     const state = stateWithSkills()
-    const statuses = (mw as any)._getStatuses(state) as Record<string, string>
-    const block = mw._renderStatusBlock(statuses, 'research', state)
+    const statuses = _getStatuses(mw._ctx, state) as Record<string, string>
+    const block = _renderStatusBlock(mw._ctx, statuses, 'research', state)
     expect(block).toContain('<available_skills>')
     expect(block).toContain('web-research')
     expect(block).toContain('formatting')
-    expect(block).not.toContain('other')
+    // "other" skill should not appear in available_skills
+    // (the word "other" appears in skill_usage boilerplate, so check specifically)
+    expect(block).not.toContain('other:')
+    expect(block).not.toContain('/skills/other/')
   })
 
   it('no skills section when feature inactive', () => {
     const mw = new TaskSteeringMiddleware({
       tasks: [{ name: 'a', instruction: 'A', tools: [toolA] }],
     })
-    const block = mw._renderStatusBlock({ a: 'in_progress' }, 'a', {})
+    const block = _renderStatusBlock(mw._ctx, { a: 'in_progress' }, 'a', {})
     expect(block).not.toContain('<available_skills>')
   })
 
@@ -233,8 +255,8 @@ describe('Skill rendering', () => {
     const mw = makeMiddleware()
     const state = stateWithSkills()
     state.taskStatuses = { research: 'complete', write: 'in_progress' }
-    const statuses = (mw as any)._getStatuses(state) as Record<string, string>
-    const block = mw._renderStatusBlock(statuses, 'write', state)
+    const statuses = _getStatuses(mw._ctx, state) as Record<string, string>
+    const block = _renderStatusBlock(mw._ctx, statuses, 'write', state)
     expect(block).toContain('<available_skills>')
     expect(block).toContain('formatting')
     expect(block).not.toContain('web-research')
@@ -243,14 +265,18 @@ describe('Skill rendering', () => {
   it('skill instruction appears in rules', () => {
     const mw = makeMiddleware()
     const state = stateWithSkills()
-    const statuses = (mw as any)._getStatuses(state) as Record<string, string>
-    const block = mw._renderStatusBlock(statuses, 'research', state)
+    const statuses = _getStatuses(mw._ctx, state) as Record<string, string>
+    const block = _renderStatusBlock(mw._ctx, statuses, 'research', state)
     expect(block).toContain('read its SKILL.md file')
   })
 
   it('no skills section without state', () => {
     const mw = makeMiddleware()
-    const block = mw._renderStatusBlock({ research: 'in_progress', write: 'pending' }, 'research')
+    const block = _renderStatusBlock(
+      mw._ctx,
+      { research: 'in_progress', write: 'pending' },
+      'research'
+    )
     expect(block).not.toContain('<available_skills>')
   })
 
@@ -268,9 +294,9 @@ describe('Skill rendering', () => {
         },
       ],
     }
-    const statuses = (mw as any)._getStatuses(state) as Record<string, string>
+    const statuses = _getStatuses(mw._ctx, state) as Record<string, string>
     const warnSpy = vi.spyOn(console, 'warn').mockImplementation(() => {})
-    mw._renderStatusBlock(statuses, 'research', state)
+    _renderStatusBlock(mw._ctx, statuses, 'research', state)
     expect(warnSpy).toHaveBeenCalledWith(expect.stringContaining('web-research'))
     expect(warnSpy).toHaveBeenCalledWith(expect.stringContaining('not found in skillsMetadata'))
     warnSpy.mockRestore()
@@ -279,9 +305,9 @@ describe('Skill rendering', () => {
   it('no warning when all skills present', () => {
     const mw = makeMiddleware()
     const state = stateWithSkills()
-    const statuses = (mw as any)._getStatuses(state) as Record<string, string>
+    const statuses = _getStatuses(mw._ctx, state) as Record<string, string>
     const warnSpy = vi.spyOn(console, 'warn').mockImplementation(() => {})
-    mw._renderStatusBlock(statuses, 'research', state)
+    _renderStatusBlock(mw._ctx, statuses, 'research', state)
     expect(warnSpy).not.toHaveBeenCalled()
     warnSpy.mockRestore()
   })
@@ -296,7 +322,7 @@ describe('Skill tool auto-whitelist', () => {
     const mw = new TaskSteeringMiddleware({
       tasks: [{ name: 'a', instruction: 'A', tools: [toolA], skills: ['s1'] }],
     })
-    const allowed = mw._allowedToolNames('a')
+    const allowed = mwAllowedToolNames(mw, 'a')
     expect(allowed.has('read_file')).toBe(true)
     expect(allowed.has('ls')).toBe(true)
   })
@@ -305,7 +331,7 @@ describe('Skill tool auto-whitelist', () => {
     const mw = new TaskSteeringMiddleware({
       tasks: [{ name: 'a', instruction: 'A', tools: [toolA] }],
     })
-    const allowed = mw._allowedToolNames('a')
+    const allowed = mwAllowedToolNames(mw, 'a')
     expect(allowed.has('read_file')).toBe(false)
     expect(allowed.has('ls')).toBe(false)
   })
@@ -317,7 +343,7 @@ describe('Skill tool auto-whitelist', () => {
         { name: 'b', instruction: 'B', tools: [toolB] },
       ],
     })
-    const allowed = mw._allowedToolNames('b')
+    const allowed = mwAllowedToolNames(mw, 'b')
     expect(allowed.has('read_file')).toBe(false)
     expect(allowed.has('ls')).toBe(false)
   })
@@ -330,7 +356,7 @@ describe('Skill tool auto-whitelist', () => {
       ],
       globalSkills: ['gs'],
     })
-    const allowed = mw._allowedToolNames('b')
+    const allowed = mwAllowedToolNames(mw, 'b')
     expect(allowed.has('read_file')).toBe(true)
     expect(allowed.has('ls')).toBe(true)
   })
@@ -340,7 +366,7 @@ describe('Skill tool auto-whitelist', () => {
       tasks: [{ name: 'a', instruction: 'A', tools: [toolA], skills: ['s1'] }],
       backendToolsPassthrough: false,
     })
-    const allowed = mw._allowedToolNames('a')
+    const allowed = mwAllowedToolNames(mw, 'a')
     expect(allowed.has('read_file')).toBe(true)
     expect(allowed.has('ls')).toBe(true)
     expect(allowed.has('write_file')).toBe(false)
@@ -352,7 +378,7 @@ describe('Skill tool auto-whitelist', () => {
       tasks: [{ name: 'a', instruction: 'A', tools: [toolA], skills: ['s1'] }],
       backendToolsPassthrough: true,
     })
-    const allowed = mw._allowedToolNames('a')
+    const allowed = mwAllowedToolNames(mw, 'a')
     expect(allowed.has('read_file')).toBe(true)
     expect(allowed.has('ls')).toBe(true)
     expect(allowed.has('write_file')).toBe(true)
@@ -373,7 +399,7 @@ describe('Skill tool auto-whitelist', () => {
         },
       ],
     }
-    const allowed = mw._allowedToolNames('a', state)
+    const allowed = mwAllowedToolNames(mw, 'a', state)
     expect(allowed.has('web_search')).toBe(true)
     expect(allowed.has('scrape_url')).toBe(true)
   })
@@ -401,11 +427,11 @@ describe('Skill tool auto-whitelist', () => {
         },
       ],
     }
-    const allowedA = mw._allowedToolNames('a', state)
+    const allowedA = mwAllowedToolNames(mw, 'a', state)
     expect(allowedA.has('web_search')).toBe(true)
     expect(allowedA.has('code_exec')).toBe(false)
 
-    const allowedB = mw._allowedToolNames('b', state)
+    const allowedB = mwAllowedToolNames(mw, 'b', state)
     expect(allowedB.has('code_exec')).toBe(true)
     expect(allowedB.has('web_search')).toBe(false)
   })
@@ -425,7 +451,7 @@ describe('Skill tool auto-whitelist', () => {
         },
       ],
     }
-    const allowed = mw._allowedToolNames('a', state)
+    const allowed = mwAllowedToolNames(mw, 'a', state)
     expect(allowed.has('format_doc')).toBe(true)
   })
 
@@ -433,7 +459,7 @@ describe('Skill tool auto-whitelist', () => {
     const mw = new TaskSteeringMiddleware({
       tasks: [{ name: 'a', instruction: 'A', tools: [toolA], skills: ['s1'] }],
     })
-    const allowed = mw._allowedToolNames('a')
+    const allowed = mwAllowedToolNames(mw, 'a')
     expect(allowed.has('read_file')).toBe(true)
     expect(allowed.has('web_search')).toBe(false)
   })
@@ -445,7 +471,7 @@ describe('Skill tool auto-whitelist', () => {
     const state = {
       skillsMetadata: [{ name: 's1', description: 'Skill 1', path: '/skills/s1/SKILL.md' }],
     }
-    const allowed = mw._allowedToolNames('a', state)
+    const allowed = mwAllowedToolNames(mw, 'a', state)
     expect(allowed.has('read_file')).toBe(true)
     expect(allowed.has('ls')).toBe(true)
   })

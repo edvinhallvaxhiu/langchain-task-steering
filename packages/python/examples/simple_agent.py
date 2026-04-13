@@ -104,6 +104,8 @@ if __name__ == "__main__":
     print("=== Streaming Updates ===\n")
     for update in agent.stream(inputs, {"recursion_limit": 50}, stream_mode="updates"):
         for node_name, state_update in update.items():
+            if state_update is None:
+                continue
             messages = state_update.get("messages", [])
             for msg in messages:
                 print_message(msg)

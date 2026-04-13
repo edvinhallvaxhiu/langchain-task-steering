@@ -12,13 +12,61 @@ export enum TaskStatus {
 }
 
 /**
+ * Configuration for post-completion message summarization.
+ *
+ * Attached to a Task via `Task.summarize`. When the task transitions to
+ * `complete`, the middleware replaces task messages according to the chosen mode.
+ *
+ * Modes:
+ *
+ * `"replace"` — Removes **all** messages produced during the task and inserts
+ * a single summary whose content is `content`. Use this when you already know
+ * the summary (e.g. a static acknowledgment).
+ *
+ * `"summarize"` — Feeds the task messages to an LLM and replaces every
+ * AI/Tool message produced during the task with the LLM's summary.
+ * HumanMessages are preserved.
+ */
+export interface TaskSummarization {
+  mode: 'replace' | 'summarize'
+  /** Replacement text for `"replace"` mode (required when mode is `"replace"`). */
+  content?: string
+  /**
+   * Chat model for `"summarize"` mode. Any object with
+   * `invoke(messages)` and optionally `ainvoke(messages)` returning
+   * `{ content: string }`. Falls back to `TaskSteeringMiddleware(model=...)`.
+   */
+  model?: unknown
+  /** Custom prompt appended after the task messages when calling the summarization model. */
+  prompt?: string
+  /**
+   * If true (default), strip the text content from the complete-transition
+   * AIMessage, keeping only its tool_calls. The text is redundant once the
+   * summary is in the ToolMessage.
+   */
+  trimCompleteMessage?: boolean
+}
+
+/**
+ * Validate a TaskSummarization config.
+ * Throws if mode is `"replace"` and `content` is not provided.
+ */
+export function validateTaskSummarization(cfg: TaskSummarization): void {
+  if (cfg.mode === 'replace' && (cfg.content == null || cfg.content === undefined)) {
+    throw new Error("TaskSummarization(mode='replace') requires 'content'.")
+  }
+}
+
+/**
  * State shape for task-steering middleware.
  */
 export interface TaskSteeringState {
   messages: unknown[]
   taskStatuses?: Record<string, string>
+  taskMessageStarts?: Record<string, number>
   nudgeCount?: number
   skillsMetadata?: SkillMetadata[]
+  activeWorkflow?: string | null
   [key: string]: unknown
 }
 
@@ -113,20 +161,32 @@ export class TaskMiddleware {
   /**
    * Called after the task transitions to in_progress.
    *
-   * Note: `state` contains the *projected* post-transition
-   * `taskStatuses` but all other fields reflect the pre-transition
-   * snapshot (the Command has not been applied to the graph yet).
-   */
-  onStart(_state: Record<string, unknown>): void {}
-
-  /**
-   * Called after the task transitions to complete (after validation).
+   * Optionally return a record of state updates to merge into the
+   * transition Command. If `messages` appears in both the returned
+   * record and the existing Command update, the arrays are **appended**
+   * (not overwritten) so the transition ToolMessage is preserved.
+   * Return `undefined` / `void` (default) for no state changes.
    *
    * Note: `state` contains the *projected* post-transition
    * `taskStatuses` but all other fields reflect the pre-transition
    * snapshot (the Command has not been applied to the graph yet).
    */
-  onComplete(_state: Record<string, unknown>): void {}
+  onStart(_state: Record<string, unknown>): Record<string, unknown> | void {}
+
+  /**
+   * Called after the task transitions to complete (after validation).
+   *
+   * Optionally return a record of state updates to merge into the
+   * transition Command. If `messages` appears in both the returned
+   * record and the existing Command update, the arrays are **appended**
+   * (not overwritten) so the transition ToolMessage is preserved.
+   * Return `undefined` / `void` (default) for no state changes.
+   *
+   * Note: `state` contains the *projected* post-transition
+   * `taskStatuses` but all other fields reflect the pre-transition
+   * snapshot (the Command has not been applied to the graph yet).
+   */
+  onComplete(_state: Record<string, unknown>): Record<string, unknown> | void {}
 
   /**
    * Async version of `validateCompletion`.
@@ -139,15 +199,15 @@ export class TaskMiddleware {
   /**
    * Async version of `onStart`. Default delegates to sync.
    */
-  async aOnStart(state: Record<string, unknown>): Promise<void> {
-    this.onStart(state)
+  async aOnStart(state: Record<string, unknown>): Promise<Record<string, unknown> | void> {
+    return this.onStart(state)
   }
 
   /**
    * Async version of `onComplete`. Default delegates to sync.
    */
-  async aOnComplete(state: Record<string, unknown>): Promise<void> {
-    this.onComplete(state)
+  async aOnComplete(state: Record<string, unknown>): Promise<Record<string, unknown> | void> {
+    return this.onComplete(state)
   }
 
   wrapToolCall?(
@@ -196,4 +256,37 @@ export interface Task {
   middleware?: TaskMiddlewareInput | TaskMiddlewareInput[]
   /** Skill names available when this task is IN_PROGRESS. */
   skills?: string[]
+  /** Optional post-completion summarization config. */
+  summarize?: TaskSummarization
+}
+
+/**
+ * A named, self-describing wrapper around a task list.
+ *
+ * The agent sees a catalog of available workflows and activates one on
+ * demand via the `activate_workflow` tool.
+ */
+export interface Workflow {
+  /** Unique workflow identifier. */
+  name: string
+  /** Shown in the catalog view so the agent can decide which workflow to activate. */
+  description: string
+  /** Ordered list of Task definitions for this workflow. */
+  tasks: Task[]
+  /** Tools available across all tasks when this workflow is active. */
+  globalTools?: ToolLike[]
+  /** Skill names available across all tasks when this workflow is active. */
+  globalSkills?: string[]
+  /** If true (default), tasks must be completed in the order they are defined. */
+  enforceOrder?: boolean
+  /**
+   * Task names that must be completed before the workflow can be considered done.
+   * Defaults to all tasks (`['*']`). Pass `null` for no required tasks.
+   */
+  requiredTasks?: readonly string[] | null
+  /**
+   * If true, the agent can deactivate this workflow even while a task is in progress.
+   * Default false blocks deactivation until the active task is completed.
+   */
+  allowDeactivateInProgress?: boolean
 }
