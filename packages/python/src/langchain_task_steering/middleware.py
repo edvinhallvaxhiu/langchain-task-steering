@@ -24,6 +24,7 @@ from typing_extensions import TypedDict
 
 from ._hooks import WRAP_HOOK_PAIRS, overrides_base
 from .types import (
+    AbortAll,
     Task,
     TaskMiddleware,
     TaskStatus,
@@ -154,6 +155,8 @@ class _ComposedTaskMiddleware(TaskMiddleware):
         for mw in self._middlewares:
             if _overrides_task(mw, "on_complete"):
                 updates = mw.on_complete(state)
+                if isinstance(updates, AbortAll):
+                    return updates
                 merged = _merge_hook_updates(merged, updates)
         return merged
 
@@ -182,6 +185,8 @@ class _ComposedTaskMiddleware(TaskMiddleware):
                 mw, "on_complete"
             ):
                 updates = await mw.aon_complete(state)
+                if isinstance(updates, AbortAll):
+                    return updates
                 merged = _merge_hook_updates(merged, updates)
         return merged
 
@@ -244,7 +249,15 @@ _STATUS_ICONS: dict[str, str] = {
     TaskStatus.PENDING.value: "[ ]",
     TaskStatus.IN_PROGRESS.value: "[>]",
     TaskStatus.COMPLETE.value: "[x]",
+    TaskStatus.ABORTED.value: "[-]",
 }
+
+# Statuses that count as "task is done" — neither blocks ordering nor needs
+# nudging to complete. Promoted to module scope so the same definition is
+# shared by every transition / nudge / ordering check.
+_TERMINAL_STATUSES: frozenset[str] = frozenset(
+    (TaskStatus.COMPLETE.value, TaskStatus.ABORTED.value)
+)
 
 
 def _find_dupes(names: list[str]) -> set[str]:
@@ -563,13 +576,32 @@ class _TaskSteeringBase(AgentMiddleware[TaskSteeringState]):
         else:
             lines = ["\n<task_pipeline>"]
 
+        has_optional = False
         for t in ctx.tasks:
             s = statuses.get(t.name, TaskStatus.PENDING.value)
-            lines.append(f"  {_STATUS_ICONS.get(s, '[?]')} {t.name} ({s})")
+            optional_tag = ""
+            if t.name not in ctx.required_tasks:
+                has_optional = True
+                optional_tag = " [optional]"
+            lines.append(
+                f"  {_STATUS_ICONS.get(s, '[?]')} {t.name} ({s}){optional_tag}"
+            )
 
         if active and active in ctx.task_map:
             lines.append(f'\n  <current_task name="{active}">')
             lines.append(f"    {ctx.task_map[active].instruction}")
+            if active not in ctx.required_tasks:
+                lines.append("")
+                lines.append(
+                    "    This task is optional. You may set it to 'in_progress' to review,"
+                )
+                lines.append(
+                    "    then abort it (update_task_status with status='aborted') if it's not"
+                )
+                lines.append(
+                    "    needed. Once you call any tool for this task, you are committed to"
+                )
+                lines.append("    completing it.")
             lines.append("  </current_task>")
 
         # ── Skill rendering ──────────────────────────────────────
@@ -599,12 +631,20 @@ class _TaskSteeringBase(AgentMiddleware[TaskSteeringState]):
                     lines.append(f"    - {skill['name']}: {desc} Path: {skill['path']}")
                 lines.append("  </available_skills>")
 
-        if ctx.enforce_order or has_visible_skills:
+        if ctx.enforce_order or has_visible_skills or has_optional:
             lines.append("\n  <rules>")
             if ctx.enforce_order:
                 order_str = " -> ".join(ctx.task_order)
                 lines.append(f"    Required order: {order_str}")
             lines.append("    Use update_task_status to advance. Do not skip tasks.")
+            if has_optional:
+                lines.append(
+                    "    Tasks marked [optional] can be aborted before their first tool"
+                )
+                lines.append(
+                    "    call (update_task_status with status='aborted'). After the first"
+                )
+                lines.append("    tool call you are committed to completing the task.")
             if has_visible_skills:
                 lines.append(
                     "    To use a skill, read its SKILL.md file for full instructions."
@@ -747,6 +787,11 @@ class _TaskSteeringBase(AgentMiddleware[TaskSteeringState]):
         if not isinstance(result, Command) or task_name not in ctx.task_map:
             return result
 
+        # Aborted is a user-driven transition: no lifecycle hooks fire and
+        # no summarization runs (the task never produced meaningful output).
+        if target == TaskStatus.ABORTED.value:
+            return result
+
         task_mw = self._get_task_middleware(ctx, task_name)
 
         if task_mw:
@@ -759,6 +804,9 @@ class _TaskSteeringBase(AgentMiddleware[TaskSteeringState]):
                 updates = task_mw.on_complete(post_state)
             else:
                 updates = None
+
+            if isinstance(updates, AbortAll):
+                return self._apply_abort_all(result, task_name, updates, ctx)
 
             merged = _merge_hook_updates(dict(result.update), updates)
             if merged is not None and merged is not result.update:
@@ -786,6 +834,9 @@ class _TaskSteeringBase(AgentMiddleware[TaskSteeringState]):
         if not isinstance(result, Command) or task_name not in ctx.task_map:
             return result
 
+        if target == TaskStatus.ABORTED.value:
+            return result
+
         task_mw = self._get_task_middleware(ctx, task_name)
 
         if task_mw:
@@ -798,6 +849,9 @@ class _TaskSteeringBase(AgentMiddleware[TaskSteeringState]):
                 updates = await task_mw.aon_complete(post_state)
             else:
                 updates = None
+
+            if isinstance(updates, AbortAll):
+                return self._apply_abort_all(result, task_name, updates, ctx)
 
             merged = _merge_hook_updates(dict(result.update), updates)
             if merged is not None and merged is not result.update:
@@ -814,6 +868,71 @@ class _TaskSteeringBase(AgentMiddleware[TaskSteeringState]):
             )
 
         return result
+
+    @staticmethod
+    def _apply_abort_all(
+        result: Command,
+        completed_task: str,
+        abort: AbortAll,
+        ctx: _PipelineContext,
+    ) -> Command:
+        """Apply an :class:`AbortAll` signal from ``on_complete``.
+
+        The task that triggered the signal (``completed_task``) remains
+        marked ``complete`` — ``AbortAll`` is a downstream decision about
+        *remaining* tasks, not a rollback.  Any still-``pending`` or
+        ``in_progress`` task is marked ``aborted``, the transition
+        ToolMessage is extended with the abort reason, and in workflow
+        mode the active workflow is deactivated.
+        """
+        update = dict(result.update) if result.update else {}
+        statuses = dict(update.get("task_statuses") or {})
+
+        aborted_names: list[str] = []
+        for name in ctx.task_order:
+            if statuses.get(name) in (
+                TaskStatus.PENDING.value,
+                TaskStatus.IN_PROGRESS.value,
+            ):
+                statuses[name] = TaskStatus.ABORTED.value
+                aborted_names.append(name)
+        update["task_statuses"] = statuses
+
+        workflow_mode = ctx.label is not None
+        if workflow_mode:
+            update["active_workflow"] = None
+            update["task_message_starts"] = {}
+            update["nudge_count"] = 0
+
+        # Extend the transition ToolMessage with the abort reason.
+        existing_msgs = list(update.get("messages", []))
+        note_parts = [
+            f"All remaining tasks aborted: {abort.reason}",
+        ]
+        if aborted_names:
+            note_parts.append(f"Aborted: {', '.join(aborted_names)}")
+        if workflow_mode:
+            note_parts.append(f"Workflow '{ctx.label}' deactivated.")
+        note = "\n\n" + "\n".join(note_parts)
+
+        for i, msg in enumerate(existing_msgs):
+            if isinstance(msg, ToolMessage):
+                existing_msgs[i] = ToolMessage(
+                    content=f"{msg.content}{note}",
+                    tool_call_id=msg.tool_call_id,
+                )
+                break
+        else:
+            # Invariant: the transition Command (built by
+            # _execute_task_transition) always carries a ToolMessage. If we
+            # ever reach here, the upstream contract has changed and the
+            # abort note would silently fall on the floor — fail loudly.
+            raise RuntimeError(
+                "AbortAll: transition Command had no ToolMessage to extend."
+            )
+
+        update["messages"] = existing_msgs
+        return Command(update=update)
 
     def _gate_tool(
         self,
@@ -880,11 +999,12 @@ class _TaskSteeringBase(AgentMiddleware[TaskSteeringState]):
     def _record_task_start(
         result: Command, state: dict, task_name: str, ctx: _PipelineContext
     ) -> Command:
-        """Inject ``task_message_starts[task_name]`` into the Command update."""
-        task = ctx.task_map[task_name]
-        if task.summarize is None:
-            return result
+        """Inject ``task_message_starts[task_name]`` into the Command update.
 
+        Always records (not just when summarization is configured) so the
+        abort-commitment check can detect whether any tool calls were made
+        during the task's in_progress window.
+        """
         start_index = len(state.get("messages", [])) + 1
         update = dict(result.update) if result.update else {}
         starts = dict(state.get("task_message_starts") or {})
@@ -1108,6 +1228,7 @@ class _TaskSteeringBase(AgentMiddleware[TaskSteeringState]):
         status: str,
         task_order: list[str],
         enforce_order: bool,
+        required_tasks: set[str],
         state: dict,
         tool_call_id: str,
         context_label: str = "",
@@ -1116,6 +1237,18 @@ class _TaskSteeringBase(AgentMiddleware[TaskSteeringState]):
 
         Shared by task-mode and workflow-mode transition tools.
         Returns a ``Command`` on success or an error string on failure.
+
+        Supports three target statuses:
+
+        - ``in_progress`` — start a task.  Blocked by required preceding
+          tasks that are not ``complete``/``aborted``.  Optional preceding
+          tasks that are still ``pending`` are skipped (so a never-started
+          optional task never blocks a required task behind it).
+        - ``complete`` — complete an ``in_progress`` task.
+        - ``aborted`` — abort an ``in_progress`` *optional* task, provided
+          no tool calls have been made for that task yet.  Required tasks
+          cannot be aborted by the agent (use :class:`AbortAll` from
+          ``on_complete`` for programmatic abort).
         """
         if task not in task_order:
             suffix = f" for {context_label}" if context_label else ""
@@ -1127,8 +1260,12 @@ class _TaskSteeringBase(AgentMiddleware[TaskSteeringState]):
         if status not in (
             TaskStatus.IN_PROGRESS.value,
             TaskStatus.COMPLETE.value,
+            TaskStatus.ABORTED.value,
         ):
-            return f"Invalid status '{status}'. Must be 'in_progress' or 'complete'."
+            return (
+                f"Invalid status '{status}'. "
+                f"Must be 'in_progress', 'complete', or 'aborted'."
+            )
 
         statuses = dict(state.get("task_statuses") or {})
         for t in task_order:
@@ -1136,8 +1273,49 @@ class _TaskSteeringBase(AgentMiddleware[TaskSteeringState]):
 
         current = statuses[task]
 
-        if current == TaskStatus.COMPLETE.value:
-            return f"Task '{task}' is already complete."
+        # ── Abort transition ─────────────────────────────────
+        if status == TaskStatus.ABORTED.value:
+            if task in required_tasks:
+                return f"Cannot abort '{task}': task is required. Complete it instead."
+            if current == TaskStatus.PENDING.value:
+                return (
+                    f"Cannot abort '{task}': task hasn't started. "
+                    f"Set it to 'in_progress' first to review, or leave it pending."
+                )
+            if current != TaskStatus.IN_PROGRESS.value:
+                return f"Task '{task}' is already {current}."
+
+            # Commitment check: any ToolMessage since the task went in_progress?
+            starts = state.get("task_message_starts") or {}
+            start_index = starts.get(task)
+            if start_index is not None:
+                messages = state.get("messages", [])
+                for msg in messages[start_index:]:
+                    if isinstance(msg, ToolMessage):
+                        return (
+                            f"Cannot abort '{task}': tools already executed — "
+                            f"task has made state changes. Complete it instead."
+                        )
+
+            statuses[task] = TaskStatus.ABORTED.value
+
+            display = "\n".join(f"  {k}: {v}" for k, v in statuses.items())
+            return Command(
+                update={
+                    "task_statuses": statuses,
+                    "nudge_count": 0,
+                    "messages": [
+                        ToolMessage(
+                            f"Task '{task}' -> aborted.\n\n{display}",
+                            tool_call_id=tool_call_id,
+                        )
+                    ],
+                }
+            )
+
+        # ── Pending → in_progress → complete ─────────────────
+        if current in _TERMINAL_STATUSES:
+            return f"Task '{task}' is already {current}."
 
         valid_next = {
             TaskStatus.PENDING.value: TaskStatus.IN_PROGRESS.value,
@@ -1153,7 +1331,13 @@ class _TaskSteeringBase(AgentMiddleware[TaskSteeringState]):
         if enforce_order and status == TaskStatus.IN_PROGRESS.value:
             idx = task_order.index(task)
             for prev in task_order[:idx]:
-                if statuses[prev] != TaskStatus.COMPLETE.value:
+                # Optional, never-started tasks don't block (dead-end fix).
+                if (
+                    prev not in required_tasks
+                    and statuses[prev] == TaskStatus.PENDING.value
+                ):
+                    continue
+                if statuses[prev] not in _TERMINAL_STATUSES:
                     return (
                         f"Cannot start '{task}': '{prev}' is not "
                         f"complete yet. "
@@ -1250,7 +1434,7 @@ class _TaskSteeringBase(AgentMiddleware[TaskSteeringState]):
             name
             for name in ctx.task_order
             if name in ctx.required_tasks
-            and statuses.get(name) != TaskStatus.COMPLETE.value
+            and statuses.get(name) not in _TERMINAL_STATUSES
         ]
 
         if not incomplete:
@@ -1457,20 +1641,25 @@ class TaskSteeringMiddleware(_TaskSteeringBase):
         """Build the update_task_status tool with closure over pipeline config."""
         task_order = self._ctx.task_order
         enforce_order = self._ctx.enforce_order
+        required_tasks = self._ctx.required_tasks
         task_names_hint = ", ".join(f"'{n}'" for n in task_order)
         execute = _TaskSteeringBase._execute_task_transition
 
         @tool(
             name_or_callable=_TRANSITION_TOOL_NAME,
             description=(
-                "Transition a task to 'in_progress' or 'complete'. "
+                "Transition a task to 'in_progress', 'complete', or 'aborted'. "
                 "Must be called ALONE — never in parallel with other tools. "
-                "Tasks must follow the defined order."
+                "Tasks must follow the defined order. "
+                "'aborted' is only valid for optional tasks that are in_progress "
+                "and have made no tool calls yet."
             ),
         )
         def update_task_status(
             task: Annotated[str, f"Task name: {task_names_hint}"],
-            status: Annotated[str, "New status: 'in_progress' or 'complete'"],
+            status: Annotated[
+                str, "New status: 'in_progress', 'complete', or 'aborted'"
+            ],
             runtime: ToolRuntime,
         ) -> Command | str:
             """Set task status with enforced transition and ordering rules."""
@@ -1479,6 +1668,7 @@ class TaskSteeringMiddleware(_TaskSteeringBase):
                 status,
                 task_order,
                 enforce_order,
+                required_tasks,
                 runtime.state,
                 runtime.tool_call_id,
             )
@@ -1803,19 +1993,24 @@ class WorkflowSteeringMiddleware(_TaskSteeringBase):
         ``_execute_task_transition`` logic.
         """
         workflow_map = self._workflow_map
+        workflow_ctxs = self._workflow_ctxs
         execute = _TaskSteeringBase._execute_task_transition
 
         @tool(
             name_or_callable=_TRANSITION_TOOL_NAME,
             description=(
-                "Transition a task to 'in_progress' or 'complete'. "
+                "Transition a task to 'in_progress', 'complete', or 'aborted'. "
                 "Must be called ALONE — never in parallel with other tools. "
-                "Tasks must follow the defined order within the active workflow."
+                "Tasks must follow the defined order within the active workflow. "
+                "'aborted' is only valid for optional tasks that are in_progress "
+                "and have made no tool calls yet."
             ),
         )
         def update_task_status(
             task: Annotated[str, "Task name within the active workflow"],
-            status: Annotated[str, "New status: 'in_progress' or 'complete'"],
+            status: Annotated[
+                str, "New status: 'in_progress', 'complete', or 'aborted'"
+            ],
             runtime: ToolRuntime,
         ) -> Command | str:
             """Set task status within the active workflow."""
@@ -1827,12 +2022,13 @@ class WorkflowSteeringMiddleware(_TaskSteeringBase):
             if wf is None:
                 return f"Active workflow '{wf_name}' not found."
 
-            task_order = [t.name for t in wf.tasks]
+            ctx = workflow_ctxs[wf_name]
             return execute(
                 task,
                 status,
-                task_order,
+                ctx.task_order,
                 wf.enforce_order,
+                ctx.required_tasks,
                 runtime.state,
                 runtime.tool_call_id,
                 context_label=f"workflow '{wf_name}'",

@@ -18,6 +18,34 @@ class TaskStatus(str, Enum):
     PENDING = "pending"
     IN_PROGRESS = "in_progress"
     COMPLETE = "complete"
+    ABORTED = "aborted"
+
+
+@dataclass
+class AbortAll:
+    """Signal from ``on_complete`` to abort all remaining tasks.
+
+    Return an ``AbortAll`` instance from :meth:`TaskMiddleware.on_complete`
+    (or ``aon_complete``) to indicate that, after this task completes, all
+    remaining ``pending`` / ``in_progress`` tasks should be marked
+    ``aborted``.
+
+    The task that returned ``AbortAll`` itself still completes successfully —
+    ``on_complete`` inspects the post-transition state and decides the
+    downstream consequence.  The middleware enforces the business rule;
+    the agent doesn't have to reason about whether to stop.
+
+    In workflow mode, ``AbortAll`` also deactivates the active workflow
+    (a workflow is one unit of work — there is no point in keeping it
+    active with no tasks left), so the agent returns to catalog mode and
+    can activate another workflow or chat freely.
+
+    The ``reason`` is surfaced to the agent in the ``update_task_status``
+    tool-response message so it knows what happened and can respond
+    naturally.
+    """
+
+    reason: str
 
 
 class SkillMetadata(TypedDict):
@@ -96,17 +124,23 @@ class TaskMiddleware(AgentMiddleware):
         """
         return None
 
-    def on_complete(self, state: dict[str, Any]) -> dict[str, Any] | None:
+    def on_complete(self, state: dict[str, Any]) -> "dict[str, Any] | AbortAll | None":
         """Called after the task transitions to complete (after validation).
 
         Use for side effects like reasoning trail capture or
         external state updates.
 
-        Optionally return a ``dict`` of state updates to merge into the
-        transition ``Command``.  If ``"messages"`` appears in both the
-        returned dict and the existing ``Command.update``, the lists are
-        **appended** (not overwritten) so the transition ``ToolMessage``
-        is preserved.  Return ``None`` (default) for no state changes.
+        Return value:
+
+        - ``None`` (default): no state changes.
+        - ``dict``: state updates to merge into the transition ``Command``.
+          If ``"messages"`` appears in both the returned dict and the
+          existing ``Command.update``, the lists are **appended** (not
+          overwritten) so the transition ``ToolMessage`` is preserved.
+        - :class:`AbortAll`: abort every remaining ``pending`` /
+          ``in_progress`` task.  In workflow mode, the active workflow is
+          also deactivated.  The ``reason`` is surfaced to the agent in
+          the tool-response message.
 
         Note: ``state`` contains the *projected* post-transition
         ``task_statuses`` but all other fields reflect the pre-transition
@@ -130,11 +164,14 @@ class TaskMiddleware(AgentMiddleware):
         """
         return self.on_start(state)
 
-    async def aon_complete(self, state: dict[str, Any]) -> dict[str, Any] | None:
+    async def aon_complete(
+        self, state: dict[str, Any]
+    ) -> "dict[str, Any] | AbortAll | None":
         """Async version of ``on_complete``.
 
         Override this for completion hooks that require async I/O.
-        The default delegates to the sync version.
+        The default delegates to the sync version.  May return
+        :class:`AbortAll` to abort remaining tasks.
         """
         return self.on_complete(state)
 

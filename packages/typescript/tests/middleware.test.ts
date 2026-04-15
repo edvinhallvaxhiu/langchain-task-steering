@@ -2278,7 +2278,11 @@ describe('Lifecycle hook state updates', () => {
     }
     const handler = vi.fn(() => ({ update: { ...originalUpdate } }))
     const result = mw.wrapToolCall(request, handler) as CommandResult
-    expect(result.update).toEqual(originalUpdate)
+    // taskMessageStarts is always recorded now (needed for abort
+    // commitment check). The hook-returned update is otherwise unchanged.
+    expect(result.update.taskStatuses).toEqual(originalUpdate.taskStatuses)
+    expect(result.update.messages).toEqual(originalUpdate.messages)
+    expect(result.update.taskMessageStarts).toEqual({ a: 1 })
   })
 
   it('composed middleware merges all returns', () => {
@@ -2545,7 +2549,8 @@ describe('Summarization — replace mode', () => {
     expect((result.update.taskMessageStarts as Record<string, number>).a).toBe(4)
   })
 
-  it('no start index without summarize config', () => {
+  it('start index recorded even without summarize config', () => {
+    // start index is always recorded — needed for the abort commitment check.
     const mw = new TaskSteeringMiddleware({
       tasks: [{ name: 'a', instruction: 'A', tools: [toolA] }],
     })
@@ -2565,7 +2570,7 @@ describe('Summarization — replace mode', () => {
       },
     }))
     const result = mw.wrapToolCall(request, handler) as CommandResult
-    expect(result.update.taskMessageStarts).toBeUndefined()
+    expect(result.update.taskMessageStarts).toEqual({ a: 1 })
   })
 
   it('replace removes all task messages and injects summary', () => {
@@ -3314,3 +3319,333 @@ describe('_buildSummaryMessages', () => {
     expect(msgs[msgs.length - 1].content).toBe('Custom prompt.')
   })
 })
+
+// ════════════════════════════════════════════════════════════
+// Abort support — status='aborted' for optional tasks
+// ════════════════════════════════════════════════════════════
+
+import { AbortAll, _executeTaskTransition } from '../src/index.js'
+import { WorkflowSteeringMiddleware, type Workflow } from '../src/index.js'
+
+function callTransition(
+  mw: TaskSteeringMiddleware,
+  taskName: string,
+  status: string,
+  state: Record<string, unknown>
+): ToolMessageResult | CommandResult {
+  const request = mockToolCallRequest({
+    toolCall: { name: 'update_task_status', args: { task: taskName, status }, id: 'call-1' },
+    state,
+  })
+  // Handler bypasses the (placeholder) transition tool by calling the shared
+  // executor directly with the same parameters the production tool uses.
+  const handler = (r: ToolCallRequest): ToolMessageResult | CommandResult =>
+    _executeTaskTransition(
+      (r.toolCall.args as { task: string; status: string }).task,
+      (r.toolCall.args as { task: string; status: string }).status,
+      mw._ctx.taskOrder,
+      mw._ctx.enforceOrder,
+      mw._ctx.requiredTasks,
+      r.state,
+      r.toolCall.id
+    )
+  return mw.wrapToolCall(request, handler)
+}
+
+describe('Abort optional task — update_task_status status=aborted', () => {
+  function makeMw(requiredTasks: string[] = ['a', 'c']): TaskSteeringMiddleware {
+    return new TaskSteeringMiddleware({
+      tasks: [
+        { name: 'a', instruction: 'A', tools: [toolA] },
+        { name: 'b', instruction: 'B', tools: [toolB] },
+        { name: 'c', instruction: 'C', tools: [toolC] },
+      ],
+      requiredTasks,
+    })
+  }
+
+  it('aborting an in_progress optional task with no tool calls succeeds', () => {
+    const mw = makeMw(['a', 'c'])
+    const state = {
+      taskStatuses: { a: 'complete', b: 'in_progress', c: 'pending' },
+      taskMessageStarts: { b: 5 },
+      messages: [
+        { role: 'ai', content: 'start a', id: 'm0' },
+        { role: 'tool', content: 'b -> in_progress', toolCallId: 'x', id: 'm4' },
+        { role: 'ai', content: 'about to abort', id: 'm5' },
+      ],
+    }
+    const result = callTransition(mw, 'b', 'aborted', state) as CommandResult
+    expect(result.update).toBeDefined()
+    const statuses = result.update.taskStatuses as Record<string, string>
+    expect(statuses.b).toBe('aborted')
+    expect(statuses.a).toBe('complete')
+    expect(statuses.c).toBe('pending')
+  })
+
+  it('aborting after tool calls is rejected', () => {
+    const mw = makeMw(['a', 'c'])
+    const state = {
+      taskStatuses: { a: 'complete', b: 'in_progress', c: 'pending' },
+      taskMessageStarts: { b: 2 },
+      messages: [
+        { role: 'ai', content: 'start', id: 'm0' },
+        { role: 'tool', content: 'b in_progress', toolCallId: 'x', id: 'm1' },
+        { role: 'ai', content: 'call tool', id: 'm2' },
+        { role: 'tool', content: 'result', toolCallId: 'y', id: 'm3' },
+      ],
+    }
+    const result = callTransition(mw, 'b', 'aborted', state) as ToolMessageResult
+    expect(result.content).toContain('tools already executed')
+  })
+
+  it('aborting a pending task is rejected', () => {
+    const mw = makeMw(['a', 'c'])
+    const state = {
+      taskStatuses: { a: 'complete', b: 'pending', c: 'pending' },
+      messages: [],
+    }
+    const result = callTransition(mw, 'b', 'aborted', state) as ToolMessageResult
+    expect(result.content).toContain("hasn't started")
+  })
+
+  it('aborting a required task is rejected', () => {
+    const mw = makeMw(['a', 'b', 'c'])
+    const state = {
+      taskStatuses: { a: 'complete', b: 'in_progress', c: 'pending' },
+      taskMessageStarts: { b: 1 },
+      messages: [{ role: 'ai', content: 'hi', id: 'm0' }],
+    }
+    const result = callTransition(mw, 'b', 'aborted', state) as ToolMessageResult
+    expect(result.content.toLowerCase()).toContain('required')
+  })
+
+  it('aborted task allows starting subsequent task (ordering)', () => {
+    const mw = makeMw(['a', 'c'])
+    const state = {
+      taskStatuses: { a: 'complete', b: 'aborted', c: 'pending' },
+      messages: [],
+    }
+    const result = callTransition(mw, 'c', 'in_progress', state) as CommandResult
+    expect(result.update).toBeDefined()
+    const statuses = result.update.taskStatuses as Record<string, string>
+    expect(statuses.c).toBe('in_progress')
+  })
+})
+
+// ════════════════════════════════════════════════════════════
+// Optional task ordering — pending non-required doesn't block
+// ════════════════════════════════════════════════════════════
+
+describe('Optional task ordering — pending non-required does not block', () => {
+  it('pending optional does not block subsequent required task', () => {
+    const mw = new TaskSteeringMiddleware({
+      tasks: [
+        { name: 'a', instruction: 'A', tools: [toolA] },
+        { name: 'b', instruction: 'B', tools: [toolB] },
+        { name: 'c', instruction: 'C', tools: [toolC] },
+      ],
+      requiredTasks: ['a', 'c'],
+    })
+    const state = {
+      taskStatuses: { a: 'complete', b: 'pending', c: 'pending' },
+      messages: [],
+    }
+    const result = callTransition(mw, 'c', 'in_progress', state) as CommandResult
+    expect(result.update).toBeDefined()
+    const statuses = result.update.taskStatuses as Record<string, string>
+    expect(statuses.c).toBe('in_progress')
+  })
+
+  it('pending required task still blocks', () => {
+    const mw = new TaskSteeringMiddleware({
+      tasks: [
+        { name: 'a', instruction: 'A', tools: [toolA] },
+        { name: 'b', instruction: 'B', tools: [toolB] },
+        { name: 'c', instruction: 'C', tools: [toolC] },
+      ],
+      requiredTasks: ['a', 'b', 'c'],
+    })
+    const state = {
+      taskStatuses: { a: 'complete', b: 'pending', c: 'pending' },
+      messages: [],
+    }
+    const result = callTransition(mw, 'c', 'in_progress', state) as ToolMessageResult
+    expect(result.content).toContain('not complete yet')
+  })
+})
+
+// ════════════════════════════════════════════════════════════
+// AbortAll — on_complete can abort remaining tasks
+// ════════════════════════════════════════════════════════════
+
+describe('AbortAll signal from onComplete', () => {
+  it('marks remaining tasks aborted and surfaces reason', () => {
+    class AbortHook extends TaskMiddleware {
+      onComplete(_state: Record<string, unknown>) {
+        return new AbortAll('upstream data missing')
+      }
+    }
+    const mw = new TaskSteeringMiddleware({
+      tasks: [
+        { name: 'a', instruction: 'A', tools: [], middleware: new AbortHook() },
+        { name: 'b', instruction: 'B', tools: [] },
+        { name: 'c', instruction: 'C', tools: [] },
+      ],
+    })
+    const request = mockToolCallRequest({
+      toolCall: { name: 'update_task_status', args: { task: 'a', status: 'complete' }, id: 'cd' },
+      state: {
+        taskStatuses: { a: 'in_progress', b: 'pending', c: 'pending' },
+        messages: [],
+      },
+    })
+    const handler = vi.fn(() => ({
+      update: {
+        taskStatuses: { a: 'complete', b: 'pending', c: 'pending' },
+        messages: [{ role: 'tool', content: "Task 'a' -> complete.", toolCallId: 'cd' }],
+      },
+    }))
+    const result = mw.wrapToolCall(request, handler) as CommandResult
+    const statuses = result.update.taskStatuses as Record<string, string>
+    expect(statuses.a).toBe('complete')
+    expect(statuses.b).toBe('aborted')
+    expect(statuses.c).toBe('aborted')
+    const msgs = result.update.messages as Array<Record<string, unknown>>
+    expect(msgs).toHaveLength(1)
+    expect(msgs[0].content).toContain('upstream data missing')
+    expect(msgs[0].content).toContain('Aborted: b, c')
+  })
+
+  it('in workflow mode, deactivates the active workflow', () => {
+    class AbortHook extends TaskMiddleware {
+      onComplete(_state: Record<string, unknown>) {
+        return new AbortAll('policy violation')
+      }
+    }
+    const wf: Workflow = {
+      name: 'wf1',
+      description: 'desc',
+      tasks: [
+        { name: 'a', instruction: 'A', tools: [], middleware: new AbortHook() },
+        { name: 'b', instruction: 'B', tools: [] },
+      ],
+    }
+    const mw = new WorkflowSteeringMiddleware({ workflows: [wf] })
+    const request = mockToolCallRequest({
+      toolCall: { name: 'update_task_status', args: { task: 'a', status: 'complete' }, id: 'cd' },
+      state: {
+        activeWorkflow: 'wf1',
+        taskStatuses: { a: 'in_progress', b: 'pending' },
+        messages: [],
+      },
+    })
+    const handler = vi.fn(() => ({
+      update: {
+        taskStatuses: { a: 'complete', b: 'pending' },
+        messages: [{ role: 'tool', content: "Task 'a' -> complete.", toolCallId: 'cd' }],
+      },
+    }))
+    const result = mw.wrapToolCall(request, handler) as CommandResult
+    expect(result.update.activeWorkflow).toBeNull()
+    const statuses = result.update.taskStatuses as Record<string, string>
+    expect(statuses.a).toBe('complete')
+    expect(statuses.b).toBe('aborted')
+    const msgs = result.update.messages as Array<Record<string, unknown>>
+    expect(msgs[0].content).toContain('policy violation')
+    expect(msgs[0].content).toContain("Workflow 'wf1' deactivated")
+  })
+})
+
+// ════════════════════════════════════════════════════════════
+// Optional task prompt — commitment rendering
+// ════════════════════════════════════════════════════════════
+
+describe('Optional task prompt rendering', () => {
+  function render(
+    mw: TaskSteeringMiddleware,
+    active: string | null = null,
+    statuses?: Record<string, string>
+  ): string {
+    const ctx = mw._ctx
+    const s =
+      statuses ??
+      (Object.fromEntries(ctx.tasks.map((t) => [t.name, 'pending'])) as Record<string, string>)
+    return _renderStatusBlock(ctx, s, active)
+  }
+
+  it('marks optional tasks with [optional] tag in the status list', () => {
+    const mw = new TaskSteeringMiddleware({
+      tasks: [
+        { name: 'a', instruction: 'A', tools: [] },
+        { name: 'b', instruction: 'B', tools: [] },
+      ],
+      requiredTasks: ['a'],
+    })
+    const block = render(mw)
+    expect(block).toContain('a (pending)')
+    expect(block).toContain('b (pending) [optional]')
+  })
+
+  it('appends commitment note when active task is optional', () => {
+    const mw = new TaskSteeringMiddleware({
+      tasks: [
+        { name: 'a', instruction: 'Do A', tools: [] },
+        { name: 'b', instruction: 'Do B', tools: [] },
+      ],
+      requiredTasks: ['a'],
+    })
+    const block = render(mw, 'b', { a: 'complete', b: 'in_progress' })
+    expect(block).toContain('This task is optional')
+    expect(block).toContain('committed to')
+  })
+
+  it('does not append commitment note when active task is required', () => {
+    const mw = new TaskSteeringMiddleware({
+      tasks: [
+        { name: 'a', instruction: 'Do A', tools: [] },
+        { name: 'b', instruction: 'Do B', tools: [] },
+      ],
+      requiredTasks: ['a', 'b'],
+    })
+    const block = render(mw, 'a', { a: 'in_progress', b: 'pending' })
+    expect(block).not.toContain('This task is optional')
+  })
+
+  it('rules block mentions abort when optional tasks present', () => {
+    const mw = new TaskSteeringMiddleware({
+      tasks: [
+        { name: 'a', instruction: 'A', tools: [] },
+        { name: 'b', instruction: 'B', tools: [] },
+      ],
+      requiredTasks: ['a'],
+    })
+    const block = render(mw)
+    expect(block).toContain('[optional]')
+    expect(block).toContain('aborted')
+  })
+})
+
+// ════════════════════════════════════════════════════════════
+// afterAgent — aborted treated like complete
+// ════════════════════════════════════════════════════════════
+
+describe('afterAgent treats aborted as terminal', () => {
+  it('does not nudge when remaining required task was aborted', () => {
+    const mw = new TaskSteeringMiddleware({
+      tasks: [
+        { name: 'a', instruction: 'A', tools: [] },
+        { name: 'b', instruction: 'B', tools: [] },
+      ],
+    })
+    const state = {
+      messages: [],
+      taskStatuses: { a: 'complete', b: 'aborted' },
+      nudgeCount: 0,
+    } as unknown as TaskSteeringStateInput
+    const result = mw.afterAgent(state)
+    expect(result).toBeNull()
+  })
+})
+
+type TaskSteeringStateInput = Parameters<TaskSteeringMiddleware['afterAgent']>[0]
