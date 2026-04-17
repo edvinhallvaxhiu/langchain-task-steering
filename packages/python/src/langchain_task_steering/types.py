@@ -9,7 +9,7 @@ from langchain.agents.middleware import AgentMiddleware
 from typing_extensions import NotRequired, TypedDict
 
 # Sentinel: "all tasks are required". Uses identity (`is`) comparison.
-_REQUIRE_ALL = ("*",)
+_REQUIRE_ALL: tuple[str, ...] = ("*",)
 
 
 class TaskStatus(str, Enum):
@@ -18,6 +18,34 @@ class TaskStatus(str, Enum):
     PENDING = "pending"
     IN_PROGRESS = "in_progress"
     COMPLETE = "complete"
+    ABORTED = "aborted"
+
+
+@dataclass
+class AbortAll:
+    """Signal from ``on_complete`` to abort all remaining tasks.
+
+    Return an ``AbortAll`` instance from :meth:`TaskMiddleware.on_complete`
+    (or ``aon_complete``) to indicate that, after this task completes, all
+    remaining ``pending`` / ``in_progress`` tasks should be marked
+    ``aborted``.
+
+    The task that returned ``AbortAll`` itself still completes successfully —
+    ``on_complete`` inspects the post-transition state and decides the
+    downstream consequence.  The middleware enforces the business rule;
+    the agent doesn't have to reason about whether to stop.
+
+    In workflow mode, ``AbortAll`` also deactivates the active workflow
+    (a workflow is one unit of work — there is no point in keeping it
+    active with no tasks left), so the agent returns to catalog mode and
+    can activate another workflow or chat freely.
+
+    The ``reason`` is surfaced to the agent in the ``update_task_status``
+    tool-response message so it knows what happened and can respond
+    naturally.
+    """
+
+    reason: str
 
 
 class SkillMetadata(TypedDict):
@@ -96,17 +124,23 @@ class TaskMiddleware(AgentMiddleware):
         """
         return None
 
-    def on_complete(self, state: dict[str, Any]) -> dict[str, Any] | None:
+    def on_complete(self, state: dict[str, Any]) -> "dict[str, Any] | AbortAll | None":
         """Called after the task transitions to complete (after validation).
 
         Use for side effects like reasoning trail capture or
         external state updates.
 
-        Optionally return a ``dict`` of state updates to merge into the
-        transition ``Command``.  If ``"messages"`` appears in both the
-        returned dict and the existing ``Command.update``, the lists are
-        **appended** (not overwritten) so the transition ``ToolMessage``
-        is preserved.  Return ``None`` (default) for no state changes.
+        Return value:
+
+        - ``None`` (default): no state changes.
+        - ``dict``: state updates to merge into the transition ``Command``.
+          If ``"messages"`` appears in both the returned dict and the
+          existing ``Command.update``, the lists are **appended** (not
+          overwritten) so the transition ``ToolMessage`` is preserved.
+        - :class:`AbortAll`: abort every remaining ``pending`` /
+          ``in_progress`` task.  In workflow mode, the active workflow is
+          also deactivated.  The ``reason`` is surfaced to the agent in
+          the tool-response message.
 
         Note: ``state`` contains the *projected* post-transition
         ``task_statuses`` but all other fields reflect the pre-transition
@@ -130,11 +164,14 @@ class TaskMiddleware(AgentMiddleware):
         """
         return self.on_start(state)
 
-    async def aon_complete(self, state: dict[str, Any]) -> dict[str, Any] | None:
+    async def aon_complete(
+        self, state: dict[str, Any]
+    ) -> "dict[str, Any] | AbortAll | None":
         """Async version of ``on_complete``.
 
         Override this for completion hooks that require async I/O.
-        The default delegates to the sync version.
+        The default delegates to the sync version.  May return
+        :class:`AbortAll` to abort remaining tasks.
         """
         return self.on_complete(state)
 
@@ -202,8 +239,18 @@ class Task:
             them (composed in order, first = outermost), or ``None``.
             Each can implement any ``AgentMiddleware`` hook plus
             ``validate_completion`` for completion gating.
+        skills: Skill names available when this task is IN_PROGRESS.
         summarize: Optional post-completion summarization config.
             See :class:`TaskSummarization`.
+        model_settings: Per-task overrides for ``ModelRequest.model_settings``,
+            applied only while this task is ``IN_PROGRESS``.  Shallow-merged
+            on top of any settings already present on the request (task keys
+            win).  Forwarded by LangChain as kwargs to the chat model's
+            ``invoke`` call, so any kwarg the provider accepts is valid
+            (e.g. ``reasoning_effort`` for OpenAI, ``thinking`` for
+            Anthropic, ``additional_model_request_fields`` for Bedrock
+            Converse).  Provider-nested configs are replaced, not deep-merged
+            — restate the full block if you need to change a leaf.
     """
 
     name: str
@@ -212,6 +259,7 @@ class Task:
     middleware: "TaskMiddleware | AgentMiddleware | list[TaskMiddleware | AgentMiddleware] | None" = None
     skills: list[str] | None = None
     summarize: "TaskSummarization | None" = None
+    model_settings: dict[str, Any] | None = None
 
 
 @dataclass
@@ -246,5 +294,5 @@ class Workflow:
     global_tools: list = field(default_factory=list)
     global_skills: list[str] | None = None
     enforce_order: bool = True
-    required_tasks: list[str] | None = _REQUIRE_ALL
+    required_tasks: list[str] | tuple[str, ...] | None = _REQUIRE_ALL
     allow_deactivate_in_progress: bool = False

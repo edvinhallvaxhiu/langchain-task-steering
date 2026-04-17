@@ -463,6 +463,88 @@ class TestWrapModelCall:
         middleware.wrap_model_call(request, handler)
         handler.assert_called_once()
 
+    def test_task_model_settings_applied_when_active(self):
+        tasks = [
+            Task(
+                name="plan",
+                instruction="Plan.",
+                tools=[tool_a],
+                model_settings={
+                    "additional_model_request_fields": {
+                        "thinking": {"type": "adaptive"},
+                        "output_config": {"effort": "high"},
+                    }
+                },
+            ),
+            Task(name="exec", instruction="Execute.", tools=[tool_b]),
+        ]
+        mw = TaskSteeringMiddleware(tasks=tasks)
+        request = MockModelRequest(
+            state={"task_statuses": {"plan": "in_progress", "exec": "pending"}},
+            system_message=MockSystemMessage("Base"),
+            tools=mw.tools,
+        )
+
+        captured = {}
+        mw.wrap_model_call(request, lambda r: captured.update(req=r) or MagicMock())
+
+        assert captured["req"].model_settings == {
+            "additional_model_request_fields": {
+                "thinking": {"type": "adaptive"},
+                "output_config": {"effort": "high"},
+            }
+        }
+
+    def test_task_model_settings_shallow_merged_over_existing(self):
+        tasks = [
+            Task(
+                name="plan",
+                instruction="Plan.",
+                tools=[tool_a],
+                model_settings={"reasoning_effort": "high"},
+            ),
+        ]
+        mw = TaskSteeringMiddleware(tasks=tasks)
+        request = MockModelRequest(
+            state={"task_statuses": {"plan": "in_progress"}},
+            system_message=MockSystemMessage("Base"),
+            tools=mw.tools,
+            model_settings={"temperature": 0.2, "reasoning_effort": "low"},
+        )
+
+        captured = {}
+        mw.wrap_model_call(request, lambda r: captured.update(req=r) or MagicMock())
+
+        # Task key wins; unrelated key preserved.
+        assert captured["req"].model_settings == {
+            "temperature": 0.2,
+            "reasoning_effort": "high",
+        }
+
+    def test_task_model_settings_not_applied_when_task_not_active(self):
+        tasks = [
+            Task(
+                name="plan",
+                instruction="Plan.",
+                tools=[tool_a],
+                model_settings={"reasoning_effort": "high"},
+            ),
+            Task(name="exec", instruction="Execute.", tools=[tool_b]),
+        ]
+        mw = TaskSteeringMiddleware(tasks=tasks)
+        # 'exec' is active, not 'plan' — plan's settings must not leak.
+        request = MockModelRequest(
+            state={"task_statuses": {"plan": "complete", "exec": "in_progress"}},
+            system_message=MockSystemMessage("Base"),
+            tools=mw.tools,
+            model_settings={"temperature": 0.2},
+        )
+
+        captured = {}
+        mw.wrap_model_call(request, lambda r: captured.update(req=r) or MagicMock())
+
+        assert captured["req"].model_settings == {"temperature": 0.2}
+
 
 # ════════════════════════════════════════════════════════════
 # wrap_tool_call — completion validation + delegation
@@ -2385,7 +2467,11 @@ class TestLifecycleHookStateUpdates:
         handler = MagicMock(return_value=Command(update=dict(original_update)))
         result = mw.wrap_tool_call(request, handler)
         assert isinstance(result, Command)
-        assert result.update == original_update
+        # task_message_starts is always recorded now (needed for abort
+        # commitment check). The hook-returned update is otherwise unchanged.
+        assert result.update["task_statuses"] == original_update["task_statuses"]
+        assert result.update["messages"] == original_update["messages"]
+        assert result.update["task_message_starts"] == {"a": 1}
 
     def test_composed_middleware_merges_all_returns(self):
         from langgraph.types import Command
@@ -2644,7 +2730,8 @@ class TestSummarizationReplace:
         result = self._start_task(mw, pre_messages)
         assert result.update["task_message_starts"]["a"] == 4
 
-    def test_no_start_index_without_summarize(self):
+    def test_start_index_recorded_even_without_summarize(self):
+        """start index is always recorded — needed for abort commitment check."""
         mw = TaskSteeringMiddleware(
             tasks=[Task(name="a", instruction="A", tools=[tool_a])]
         )
@@ -2669,7 +2756,7 @@ class TestSummarizationReplace:
             ),
         )
         assert isinstance(result, Command)
-        assert "task_message_starts" not in result.update
+        assert result.update["task_message_starts"] == {"a": 1}
 
     def test_replace_removes_all_task_messages(self):
         mw = self._build_middleware()
@@ -3295,3 +3382,1129 @@ class TestSummarizationAsync:
             m for m in result.update["messages"] if isinstance(m, RemoveMessage)
         ]
         assert len(remove_ops) == 1  # only task work
+
+
+# ════════════════════════════════════════════════════════════
+# Abort support — status='aborted' for optional tasks
+# ════════════════════════════════════════════════════════════
+
+
+class TestAbortOptionalTask:
+    """update_task_status('X', 'aborted') for optional tasks."""
+
+    def _make_mw(self, required_tasks=None):
+        tasks = [
+            Task(name="a", instruction="A", tools=[tool_a]),
+            Task(name="b", instruction="B", tools=[tool_b]),
+            Task(name="c", instruction="C", tools=[tool_c]),
+        ]
+        return TaskSteeringMiddleware(
+            tasks=tasks,
+            required_tasks=required_tasks if required_tasks is not None else ["a", "c"],
+        )
+
+    def _call_transition(self, mw, task, status, state):
+        from langgraph.types import Command
+
+        request = MockToolCallRequest(
+            tool_call={
+                "name": "update_task_status",
+                "args": {"task": task, "status": status},
+                "id": "call-1",
+            },
+            state=state,
+        )
+
+        # Handler bypasses pydantic-based tool.invoke (no runtime needed).
+        def handler(r):
+            args = r.tool_call["args"]
+            return mw._execute_task_transition(
+                args["task"],
+                args["status"],
+                mw._ctx.task_order,
+                mw._ctx.enforce_order,
+                mw._ctx.required_tasks,
+                r.state,
+                r.tool_call["id"],
+            )
+
+        return mw.wrap_tool_call(request, handler)
+
+    def test_abort_in_progress_optional_with_no_tool_calls_succeeds(self):
+        from langgraph.types import Command
+
+        mw = self._make_mw(required_tasks=["a", "c"])  # b is optional
+        state = {
+            "task_statuses": {
+                "a": "complete",
+                "b": "in_progress",
+                "c": "pending",
+            },
+            "task_message_starts": {"b": 5},
+            "messages": [
+                AIMessage(content="start a", id="m0"),
+                ToolMessage(content="b -> in_progress", tool_call_id="x", id="m4"),
+                AIMessage(content="about to abort", id="m5"),
+            ],
+        }
+        result = self._call_transition(mw, "b", "aborted", state)
+        assert isinstance(result, Command)
+        assert result.update["task_statuses"]["b"] == "aborted"
+        assert result.update["task_statuses"]["a"] == "complete"
+        assert result.update["task_statuses"]["c"] == "pending"
+
+    def test_abort_with_tool_calls_rejected(self):
+        mw = self._make_mw(required_tasks=["a", "c"])
+        state = {
+            "task_statuses": {
+                "a": "complete",
+                "b": "in_progress",
+                "c": "pending",
+            },
+            "task_message_starts": {"b": 2},
+            "messages": [
+                AIMessage(content="start", id="m0"),
+                ToolMessage(content="b in_progress", tool_call_id="x", id="m1"),
+                AIMessage(content="call tool", id="m2"),
+                ToolMessage(content="result", tool_call_id="y", id="m3"),
+            ],
+        }
+        result = self._call_transition(mw, "b", "aborted", state)
+        assert "tools already executed" in str(result)
+
+    def test_abort_pending_task_rejected(self):
+        mw = self._make_mw(required_tasks=["a", "c"])
+        state = {
+            "task_statuses": {"a": "complete", "b": "pending", "c": "pending"},
+            "messages": [],
+        }
+        result = self._call_transition(mw, "b", "aborted", state)
+        assert "hasn't started" in str(result)
+
+    def test_abort_required_task_rejected(self):
+        mw = self._make_mw(required_tasks=["a", "b", "c"])
+        state = {
+            "task_statuses": {"a": "complete", "b": "in_progress", "c": "pending"},
+            "task_message_starts": {"b": 1},
+            "messages": [AIMessage(content="hi", id="m0")],
+        }
+        result = self._call_transition(mw, "b", "aborted", state)
+        assert "required" in str(result).lower()
+
+    def test_abort_already_complete_rejected(self):
+        mw = self._make_mw(required_tasks=["a", "c"])
+        state = {
+            "task_statuses": {"a": "complete", "b": "complete", "c": "pending"},
+            "messages": [],
+        }
+        result = self._call_transition(mw, "b", "aborted", state)
+        assert "already complete" in str(result)
+
+    def test_abort_allows_subsequent_required_task(self):
+        """Aborted tasks don't block subsequent tasks (ordering)."""
+        from langgraph.types import Command
+
+        mw = self._make_mw(required_tasks=["a", "c"])
+        # b aborted, now start c
+        state = {
+            "task_statuses": {
+                "a": "complete",
+                "b": "aborted",
+                "c": "pending",
+            },
+            "messages": [],
+        }
+        result = self._call_transition(mw, "c", "in_progress", state)
+        assert isinstance(result, Command)
+        assert result.update["task_statuses"]["c"] == "in_progress"
+
+
+# ════════════════════════════════════════════════════════════
+# Optional task ordering — pending non-required doesn't block
+# ════════════════════════════════════════════════════════════
+
+
+class TestOptionalTaskOrdering:
+    def test_pending_optional_doesnt_block_subsequent_required(self):
+        """Bug fix: pending non-required task previously blocked required tasks behind it."""
+        from langgraph.types import Command
+
+        tasks = [
+            Task(name="a", instruction="A", tools=[tool_a]),
+            Task(name="b", instruction="B", tools=[tool_b]),
+            Task(name="c", instruction="C", tools=[tool_c]),
+        ]
+        mw = TaskSteeringMiddleware(tasks=tasks, required_tasks=["a", "c"])
+
+        # a complete, b pending (optional), try to start c
+        state = {
+            "task_statuses": {"a": "complete", "b": "pending", "c": "pending"},
+            "messages": [],
+        }
+        request = MockToolCallRequest(
+            tool_call={
+                "name": "update_task_status",
+                "args": {"task": "c", "status": "in_progress"},
+                "id": "call-1",
+            },
+            state=state,
+        )
+
+        def handler(r):
+            args = r.tool_call["args"]
+            return mw._execute_task_transition(
+                args["task"],
+                args["status"],
+                mw._ctx.task_order,
+                mw._ctx.enforce_order,
+                mw._ctx.required_tasks,
+                r.state,
+                r.tool_call["id"],
+            )
+
+        result = mw.wrap_tool_call(request, handler)
+        assert isinstance(result, Command)
+        assert result.update["task_statuses"]["c"] == "in_progress"
+
+    def test_pending_required_still_blocks(self):
+        """Pending required tasks still block subsequent tasks."""
+        tasks = [
+            Task(name="a", instruction="A", tools=[tool_a]),
+            Task(name="b", instruction="B", tools=[tool_b]),
+            Task(name="c", instruction="C", tools=[tool_c]),
+        ]
+        mw = TaskSteeringMiddleware(tasks=tasks, required_tasks=["a", "b", "c"])
+
+        state = {
+            "task_statuses": {"a": "complete", "b": "pending", "c": "pending"},
+            "messages": [],
+        }
+        request = MockToolCallRequest(
+            tool_call={
+                "name": "update_task_status",
+                "args": {"task": "c", "status": "in_progress"},
+                "id": "call-1",
+            },
+            state=state,
+        )
+
+        def handler(r):
+            args = r.tool_call["args"]
+            return mw._execute_task_transition(
+                args["task"],
+                args["status"],
+                mw._ctx.task_order,
+                mw._ctx.enforce_order,
+                mw._ctx.required_tasks,
+                r.state,
+                r.tool_call["id"],
+            )
+
+        result = mw.wrap_tool_call(request, handler)
+        assert "not complete yet" in str(result)
+
+    def test_aborted_task_treated_like_complete_for_ordering(self):
+        from langgraph.types import Command
+
+        tasks = [
+            Task(name="a", instruction="A", tools=[tool_a]),
+            Task(name="b", instruction="B", tools=[tool_b]),
+        ]
+        # Make both optional so 'b' could previously be aborted, but here
+        # we just seed it as aborted and check that it doesn't block.
+        mw = TaskSteeringMiddleware(tasks=tasks, required_tasks=["a"])
+
+        state = {
+            "task_statuses": {"a": "aborted", "b": "pending"},
+            "messages": [],
+        }
+        request = MockToolCallRequest(
+            tool_call={
+                "name": "update_task_status",
+                "args": {"task": "b", "status": "in_progress"},
+                "id": "c1",
+            },
+            state=state,
+        )
+
+        def handler(r):
+            args = r.tool_call["args"]
+            return mw._execute_task_transition(
+                args["task"],
+                args["status"],
+                mw._ctx.task_order,
+                mw._ctx.enforce_order,
+                mw._ctx.required_tasks,
+                r.state,
+                r.tool_call["id"],
+            )
+
+        result = mw.wrap_tool_call(request, handler)
+        assert isinstance(result, Command)
+        assert result.update["task_statuses"]["b"] == "in_progress"
+
+
+# ════════════════════════════════════════════════════════════
+# AbortAll — on_complete can abort remaining tasks
+# ════════════════════════════════════════════════════════════
+
+
+class TestAbortAll:
+    def test_abort_all_marks_remaining_tasks_aborted(self):
+        from langgraph.types import Command
+        from langchain_task_steering import AbortAll
+
+        class AbortOnComplete(TaskMiddleware):
+            def on_complete(self, state):
+                return AbortAll(reason="upstream data missing")
+
+        tasks = [
+            Task(name="a", instruction="A", tools=[], middleware=AbortOnComplete()),
+            Task(name="b", instruction="B", tools=[]),
+            Task(name="c", instruction="C", tools=[]),
+        ]
+        mw = TaskSteeringMiddleware(tasks=tasks)
+
+        state = {
+            "task_statuses": {"a": "in_progress", "b": "pending", "c": "pending"},
+            "messages": [],
+        }
+        request = MockToolCallRequest(
+            tool_call={
+                "name": "update_task_status",
+                "args": {"task": "a", "status": "complete"},
+                "id": "call-done",
+            },
+            state=state,
+        )
+
+        def handler(r):
+            return Command(
+                update={
+                    "task_statuses": {
+                        "a": "complete",
+                        "b": "pending",
+                        "c": "pending",
+                    },
+                    "messages": [
+                        ToolMessage(
+                            content="Task 'a' -> complete.",
+                            tool_call_id="call-done",
+                        )
+                    ],
+                }
+            )
+
+        result = mw.wrap_tool_call(request, handler)
+        assert isinstance(result, Command)
+        statuses = result.update["task_statuses"]
+        assert statuses["a"] == "complete"
+        assert statuses["b"] == "aborted"
+        assert statuses["c"] == "aborted"
+        msgs = [m for m in result.update["messages"] if isinstance(m, ToolMessage)]
+        assert len(msgs) == 1
+        assert "upstream data missing" in msgs[0].content
+        assert "Aborted: b, c" in msgs[0].content
+
+    def test_abort_all_in_workflow_deactivates_workflow(self):
+        from langgraph.types import Command
+        from langchain_task_steering import (
+            AbortAll,
+            Workflow,
+            WorkflowSteeringMiddleware,
+        )
+
+        class AbortOnComplete(TaskMiddleware):
+            def on_complete(self, state):
+                return AbortAll(reason="policy violation")
+
+        wf = Workflow(
+            name="wf1",
+            description="desc",
+            tasks=[
+                Task(
+                    name="a",
+                    instruction="A",
+                    tools=[],
+                    middleware=AbortOnComplete(),
+                ),
+                Task(name="b", instruction="B", tools=[]),
+            ],
+        )
+        mw = WorkflowSteeringMiddleware(workflows=[wf])
+
+        state = {
+            "active_workflow": "wf1",
+            "task_statuses": {"a": "in_progress", "b": "pending"},
+            "messages": [],
+        }
+        request = MockToolCallRequest(
+            tool_call={
+                "name": "update_task_status",
+                "args": {"task": "a", "status": "complete"},
+                "id": "cd",
+            },
+            state=state,
+        )
+
+        def handler(r):
+            return Command(
+                update={
+                    "task_statuses": {"a": "complete", "b": "pending"},
+                    "messages": [
+                        ToolMessage(
+                            content="Task 'a' -> complete.",
+                            tool_call_id="cd",
+                        )
+                    ],
+                }
+            )
+
+        result = mw.wrap_tool_call(request, handler)
+        assert isinstance(result, Command)
+        assert result.update["active_workflow"] is None
+        assert result.update["task_statuses"]["a"] == "complete"
+        assert result.update["task_statuses"]["b"] == "aborted"
+        msgs = [m for m in result.update["messages"] if isinstance(m, ToolMessage)]
+        assert "policy violation" in msgs[0].content
+        assert "Workflow 'wf1' deactivated" in msgs[0].content
+
+
+# ════════════════════════════════════════════════════════════
+# Optional task prompt — commitment rendering
+# ════════════════════════════════════════════════════════════
+
+
+class TestOptionalTaskPrompt:
+    def _render(self, mw, active=None, statuses=None):
+        ctx = mw._ctx
+        if statuses is None:
+            statuses = {t.name: "pending" for t in ctx.tasks}
+        return mw._render_status_block(ctx, statuses, active)
+
+    def test_optional_tag_in_status_list(self):
+        tasks = [
+            Task(name="a", instruction="A", tools=[]),
+            Task(name="b", instruction="B", tools=[]),
+        ]
+        mw = TaskSteeringMiddleware(tasks=tasks, required_tasks=["a"])
+        block = self._render(mw)
+        assert "a (pending)" in block
+        assert "b (pending) [optional]" in block
+
+    def test_commitment_note_on_active_optional(self):
+        tasks = [
+            Task(name="a", instruction="Do A", tools=[]),
+            Task(name="b", instruction="Do B", tools=[]),
+        ]
+        mw = TaskSteeringMiddleware(tasks=tasks, required_tasks=["a"])
+        block = self._render(
+            mw,
+            active="b",
+            statuses={"a": "complete", "b": "in_progress"},
+        )
+        assert "This task is optional" in block
+        assert "committed to" in block
+
+    def test_no_commitment_note_on_active_required(self):
+        tasks = [
+            Task(name="a", instruction="Do A", tools=[]),
+            Task(name="b", instruction="Do B", tools=[]),
+        ]
+        mw = TaskSteeringMiddleware(tasks=tasks, required_tasks=["a", "b"])
+        block = self._render(
+            mw,
+            active="a",
+            statuses={"a": "in_progress", "b": "pending"},
+        )
+        assert "This task is optional" not in block
+
+    def test_rules_block_mentions_abort_when_optional_present(self):
+        tasks = [
+            Task(name="a", instruction="A", tools=[]),
+            Task(name="b", instruction="B", tools=[]),
+        ]
+        mw = TaskSteeringMiddleware(tasks=tasks, required_tasks=["a"])
+        block = self._render(mw)
+        assert "[optional]" in block
+        assert "aborted" in block
+
+
+# ════════════════════════════════════════════════════════════
+# after_agent treats aborted like complete
+# ════════════════════════════════════════════════════════════
+
+
+class TestAfterAgentAborted:
+    def test_aborted_required_task_does_not_nudge(self):
+        """after_agent should not nudge if a required task was aborted via AbortAll."""
+        tasks = [
+            Task(name="a", instruction="A", tools=[]),
+            Task(name="b", instruction="B", tools=[]),
+        ]
+        mw = TaskSteeringMiddleware(tasks=tasks)
+        state = {
+            "task_statuses": {"a": "complete", "b": "aborted"},
+            "nudge_count": 0,
+            "messages": [],
+        }
+        result = mw.after_agent(state, runtime=None)
+        assert result is None
+
+
+# ════════════════════════════════════════════════════════════
+# Composed middleware: AbortAll short-circuit + async chains
+# ════════════════════════════════════════════════════════════
+
+
+class TestComposedAbortAll:
+    def test_sync_on_complete_abort_all_short_circuits(self):
+        """In a composed on_complete, AbortAll from the first mw halts the chain."""
+        from langchain_task_steering import AbortAll
+
+        ran: list[str] = []
+
+        class First(TaskMiddleware):
+            def on_complete(self, state):
+                ran.append("first")
+                return AbortAll(reason="halt")
+
+        class Second(TaskMiddleware):
+            def on_complete(self, state):
+                ran.append("second")
+                return None
+
+        tasks = [
+            Task(name="a", instruction="A", tools=[], middleware=[First(), Second()]),
+            Task(name="b", instruction="B", tools=[]),
+        ]
+        mw = TaskSteeringMiddleware(tasks=tasks)
+
+        request = MockToolCallRequest(
+            tool_call={
+                "name": "update_task_status",
+                "args": {"task": "a", "status": "complete"},
+                "id": "call-1",
+            },
+            state={
+                "task_statuses": {"a": "in_progress", "b": "pending"},
+                "messages": [],
+            },
+        )
+
+        def handler(r):
+            return Command(
+                update={
+                    "task_statuses": {"a": "complete", "b": "pending"},
+                    "messages": [
+                        ToolMessage(content="Task 'a' -> complete.", tool_call_id="call-1")
+                    ],
+                }
+            )
+
+        result = mw.wrap_tool_call(request, handler)
+        assert ran == ["first"]
+        assert isinstance(result, Command)
+        assert result.update["task_statuses"]["b"] == "aborted"
+
+    @pytest.mark.asyncio
+    async def test_async_aon_complete_abort_all_short_circuits(self):
+        """Async aon_complete AbortAll from first mw halts the chain."""
+        from langchain_task_steering import AbortAll
+
+        ran: list[str] = []
+
+        class First(TaskMiddleware):
+            async def aon_complete(self, state):
+                ran.append("first")
+                return AbortAll(reason="halt")
+
+        class Second(TaskMiddleware):
+            async def aon_complete(self, state):
+                ran.append("second")
+                return None
+
+        tasks = [
+            Task(name="a", instruction="A", tools=[], middleware=[First(), Second()]),
+            Task(name="b", instruction="B", tools=[]),
+        ]
+        mw = TaskSteeringMiddleware(tasks=tasks)
+
+        request = MockToolCallRequest(
+            tool_call={
+                "name": "update_task_status",
+                "args": {"task": "a", "status": "complete"},
+                "id": "call-1",
+            },
+            state={
+                "task_statuses": {"a": "in_progress", "b": "pending"},
+                "messages": [],
+            },
+        )
+
+        async def async_handler(r):
+            return Command(
+                update={
+                    "task_statuses": {"a": "complete", "b": "pending"},
+                    "messages": [
+                        ToolMessage(content="Task 'a' -> complete.", tool_call_id="call-1")
+                    ],
+                }
+            )
+
+        result = await mw.awrap_tool_call(request, async_handler)
+        assert ran == ["first"]
+        assert isinstance(result, Command)
+        assert result.update["task_statuses"]["b"] == "aborted"
+
+    @pytest.mark.asyncio
+    async def test_async_aon_complete_merges_dicts_from_all(self):
+        """If no mw returns AbortAll, async chain merges dict updates from all."""
+
+        class First(TaskMiddleware):
+            async def aon_complete(self, state):
+                return {"custom_first": 1}
+
+        class Second(TaskMiddleware):
+            async def aon_complete(self, state):
+                return {"custom_second": 2}
+
+        tasks = [
+            Task(name="a", instruction="A", tools=[], middleware=[First(), Second()])
+        ]
+        mw = TaskSteeringMiddleware(tasks=tasks)
+
+        request = MockToolCallRequest(
+            tool_call={
+                "name": "update_task_status",
+                "args": {"task": "a", "status": "complete"},
+                "id": "call-1",
+            },
+            state={"task_statuses": {"a": "in_progress"}, "messages": []},
+        )
+
+        async def async_handler(r):
+            return Command(
+                update={
+                    "task_statuses": {"a": "complete"},
+                    "messages": [
+                        ToolMessage(content="done", tool_call_id="call-1")
+                    ],
+                }
+            )
+
+        result = await mw.awrap_tool_call(request, async_handler)
+        assert isinstance(result, Command)
+        assert result.update["custom_first"] == 1
+        assert result.update["custom_second"] == 2
+
+
+class TestAsyncComposedWrap:
+    @pytest.mark.asyncio
+    async def test_awrap_model_call_chains_in_order(self):
+        call_order: list[str] = []
+
+        class Outer(TaskMiddleware):
+            async def awrap_model_call(self, request, handler):
+                call_order.append("outer-before")
+                result = await handler(request)
+                call_order.append("outer-after")
+                return result
+
+        class Inner(TaskMiddleware):
+            async def awrap_model_call(self, request, handler):
+                call_order.append("inner-before")
+                result = await handler(request)
+                call_order.append("inner-after")
+                return result
+
+        tasks = [
+            Task(
+                name="a",
+                instruction="A",
+                tools=[tool_a],
+                middleware=[Outer(), Inner()],
+            )
+        ]
+        mw = TaskSteeringMiddleware(tasks=tasks)
+
+        request = MockModelRequest(
+            state={"task_statuses": {"a": "in_progress"}},
+            system_message=MockSystemMessage("Base"),
+            tools=mw.tools,
+        )
+
+        async def async_handler(r):
+            call_order.append("handler")
+            return MagicMock()
+
+        await mw.awrap_model_call(request, async_handler)
+        assert call_order == [
+            "outer-before",
+            "inner-before",
+            "handler",
+            "inner-after",
+            "outer-after",
+        ]
+
+    @pytest.mark.asyncio
+    async def test_awrap_tool_call_chains_in_order(self):
+        call_order: list[str] = []
+
+        class Outer(TaskMiddleware):
+            async def awrap_tool_call(self, request, handler):
+                call_order.append("outer")
+                return await handler(request)
+
+        class Inner(TaskMiddleware):
+            async def awrap_tool_call(self, request, handler):
+                call_order.append("inner")
+                return await handler(request)
+
+        tasks = [
+            Task(
+                name="a",
+                instruction="A",
+                tools=[tool_a],
+                middleware=[Outer(), Inner()],
+            )
+        ]
+        mw = TaskSteeringMiddleware(tasks=tasks)
+
+        request = MockToolCallRequest(
+            tool_call={"name": "tool_a", "args": {}, "id": "call-1"},
+            state={"task_statuses": {"a": "in_progress"}},
+        )
+        expected = ToolMessage(content="ok", tool_call_id="call-1")
+
+        async def async_handler(r):
+            call_order.append("handler")
+            return expected
+
+        await mw.awrap_tool_call(request, async_handler)
+        assert call_order == ["outer", "inner", "handler"]
+
+
+class TestAsyncLifecycleFallbacks:
+    """Async hooks on _ComposedTaskMiddleware fall back to sync overrides."""
+
+    @pytest.mark.asyncio
+    async def test_avalidate_uses_sync_validate_completion(self):
+        """Composed avalidate_completion should invoke sync-only validators."""
+
+        class SyncReject(TaskMiddleware):
+            def validate_completion(self, state):
+                return "sync rejected"
+
+        class NoopAsync(TaskMiddleware):
+            async def avalidate_completion(self, state):
+                return None
+
+        tasks = [
+            Task(
+                name="a",
+                instruction="A",
+                tools=[],
+                middleware=[SyncReject(), NoopAsync()],
+            )
+        ]
+        mw = TaskSteeringMiddleware(tasks=tasks)
+
+        request = MockToolCallRequest(
+            tool_call={
+                "name": "update_task_status",
+                "args": {"task": "a", "status": "complete"},
+                "id": "call-1",
+            },
+            state={"task_statuses": {"a": "in_progress"}},
+        )
+
+        async def async_handler(r):
+            return MagicMock()
+
+        result = await mw.awrap_tool_call(request, async_handler)
+        assert isinstance(result, ToolMessage)
+        assert "sync rejected" in result.content
+
+    @pytest.mark.asyncio
+    async def test_aon_complete_uses_sync_on_complete(self):
+        """Composed aon_complete should invoke sync-only on_complete hooks."""
+        ran: list[str] = []
+
+        class SyncComplete(TaskMiddleware):
+            def on_complete(self, state):
+                ran.append("sync")
+                return None
+
+        class AsyncComplete(TaskMiddleware):
+            async def aon_complete(self, state):
+                ran.append("async")
+                return None
+
+        tasks = [
+            Task(
+                name="a",
+                instruction="A",
+                tools=[],
+                middleware=[SyncComplete(), AsyncComplete()],
+            )
+        ]
+        mw = TaskSteeringMiddleware(tasks=tasks)
+
+        request = MockToolCallRequest(
+            tool_call={
+                "name": "update_task_status",
+                "args": {"task": "a", "status": "complete"},
+                "id": "call-1",
+            },
+            state={"task_statuses": {"a": "in_progress"}, "messages": []},
+        )
+
+        async def async_handler(r):
+            return Command(
+                update={
+                    "task_statuses": {"a": "complete"},
+                    "messages": [
+                        ToolMessage(content="done", tool_call_id="call-1")
+                    ],
+                }
+            )
+
+        await mw.awrap_tool_call(request, async_handler)
+        assert ran == ["sync", "async"]
+
+
+# ════════════════════════════════════════════════════════════
+# Duck-typed middleware with async-only wrap hook
+# ════════════════════════════════════════════════════════════
+
+
+class TestDuckTypedAsyncOnly:
+    def test_async_only_wrap_hook_accepted(self):
+        """An object with only awrap_model_call should be accepted via duck-type."""
+
+        class AsyncDuck:
+            async def awrap_model_call(self, request, handler):
+                return await handler(request)
+
+        tasks = [
+            Task(name="a", instruction="A", tools=[], middleware=AsyncDuck())
+        ]
+        mw = TaskSteeringMiddleware(tasks=tasks)
+        # Acceptance = coercion succeeded and produced a non-None middleware
+        assert mw._ctx.task_map["a"].middleware is not None
+
+
+# ════════════════════════════════════════════════════════════
+# Summarization edge cases + helpers
+# ════════════════════════════════════════════════════════════
+
+
+class TestSummarizationEmpty:
+    def test_skipped_when_zero_task_messages(self):
+        """Summarize is skipped when the task produced no messages before complete."""
+        mw = TaskSteeringMiddleware(
+            tasks=[
+                Task(
+                    name="a",
+                    instruction="Do stuff.",
+                    tools=[tool_a],
+                    summarize=TaskSummarization(mode="replace", content="SUMMARY"),
+                ),
+            ],
+        )
+
+        complete_ai = AIMessage(
+            content="",
+            id="c-ai",
+            tool_calls=[
+                {
+                    "name": "update_task_status",
+                    "args": {"task": "a", "status": "complete"},
+                    "id": "call-done",
+                }
+            ],
+        )
+
+        # start_index points at the complete_ai itself — no messages between.
+        state = {
+            "task_statuses": {"a": "in_progress"},
+            "task_message_starts": {"a": 0},
+            "messages": [complete_ai],
+        }
+
+        request = MockToolCallRequest(
+            tool_call={
+                "name": "update_task_status",
+                "args": {"task": "a", "status": "complete"},
+                "id": "call-done",
+            },
+            state=state,
+        )
+
+        transition_msg = ToolMessage(content="ok", tool_call_id="call-done")
+        result = mw.wrap_tool_call(
+            request,
+            MagicMock(
+                return_value=Command(
+                    update={
+                        "task_statuses": {"a": "complete"},
+                        "messages": [transition_msg],
+                    }
+                )
+            ),
+        )
+
+        # No RemoveMessage ops — summarization returned early.
+        assert isinstance(result, Command)
+        assert all(not isinstance(m, RemoveMessage) for m in result.update["messages"])
+        # Transition ToolMessage was not rewritten with "SUMMARY".
+        tool_msgs = [m for m in result.update["messages"] if isinstance(m, ToolMessage)]
+        assert tool_msgs and "SUMMARY" not in tool_msgs[0].content
+
+
+class TestExtractResponseText:
+    def _extract(self, content):
+        from langchain_task_steering.middleware import _TaskSteeringBase
+
+        return _TaskSteeringBase._extract_response_text(content)
+
+    def test_plain_string_returned_as_is(self):
+        assert self._extract("hello") == "hello"
+
+    def test_content_blocks_joined(self):
+        blocks = [
+            {"type": "reasoning", "text": "ignored"},
+            {"type": "text", "text": "first"},
+            {"type": "text", "text": "second"},
+        ]
+        assert self._extract(blocks) == "first\nsecond"
+
+    def test_unknown_type_falls_back_to_str(self):
+        class Weird:
+            def __str__(self):
+                return "weird-str"
+
+        assert self._extract(Weird()) == "weird-str"
+
+
+class TestFlattenForSummary:
+    def _flatten(self, msgs):
+        from langchain_task_steering.middleware import _TaskSteeringBase
+
+        return _TaskSteeringBase._flatten_for_summary(msgs)
+
+    def test_ai_message_list_content_and_tool_calls_included(self):
+        ai = AIMessage(
+            content=[
+                {"type": "reasoning", "text": "think"},
+                {"type": "text", "text": "did something"},
+            ],
+            tool_calls=[{"name": "tool_a", "args": {"x": 1}, "id": "c1"}],
+        )
+        flat = self._flatten([ai])
+        assert len(flat) == 1
+        assert isinstance(flat[0], AIMessage)
+        assert "did something" in flat[0].content
+        assert "tool_a" in flat[0].content
+        assert "{'x': 1}" in flat[0].content
+
+    def test_tool_message_wrapped_as_human(self):
+        tm = ToolMessage(content="result data", tool_call_id="c1", name="tool_a")
+        flat = self._flatten([tm])
+        assert len(flat) == 1
+        assert isinstance(flat[0], HumanMessage)
+        assert "tool_a" in flat[0].content
+        assert "result data" in flat[0].content
+
+    def test_human_message_plain_content_preserved(self):
+        hm = HumanMessage(content="user input")
+        flat = self._flatten([hm])
+        assert len(flat) == 1
+        assert isinstance(flat[0], HumanMessage)
+        assert flat[0].content == "user input"
+
+
+# ════════════════════════════════════════════════════════════
+# Async no-pipeline + task-middleware dispatch
+# ════════════════════════════════════════════════════════════
+
+
+class TestAsyncNoPipelineAndDispatch:
+    @pytest.mark.asyncio
+    async def test_awrap_tool_call_no_pipeline_passes_through(self):
+        """When state has no task_statuses (no pipeline yet), awrap_tool_call passes through."""
+        tasks = [Task(name="a", instruction="A", tools=[tool_a])]
+        mw = TaskSteeringMiddleware(tasks=tasks)
+
+        # _get_pipeline_ctx returns the ctx (task mode always has one), so
+        # force the None branch by subclassing.
+        class NoPipelineMw(TaskSteeringMiddleware):
+            def _get_pipeline_ctx(self, state):
+                return None
+
+        mw2 = NoPipelineMw(tasks=tasks)
+
+        handler_called = []
+
+        async def async_handler(r):
+            handler_called.append(True)
+            return ToolMessage(content="ok", tool_call_id="c1")
+
+        request = MockToolCallRequest(
+            tool_call={"name": "tool_a", "args": {}, "id": "c1"},
+            state={},
+        )
+        result = await mw2.awrap_tool_call(request, async_handler)
+        assert handler_called == [True]
+        assert isinstance(result, ToolMessage)
+
+    @pytest.mark.asyncio
+    async def test_awrap_tool_call_dispatches_to_task_middleware(self):
+        """Task middleware awrap_tool_call override should run on non-transition calls."""
+        seen: list[str] = []
+
+        class WrapMw(TaskMiddleware):
+            async def awrap_tool_call(self, request, handler):
+                seen.append(request.tool_call["name"])
+                return await handler(request)
+
+        tasks = [
+            Task(name="a", instruction="A", tools=[tool_a], middleware=WrapMw())
+        ]
+        mw = TaskSteeringMiddleware(tasks=tasks)
+
+        request = MockToolCallRequest(
+            tool_call={"name": "tool_a", "args": {}, "id": "c1"},
+            state={"task_statuses": {"a": "in_progress"}},
+        )
+        expected = ToolMessage(content="ok", tool_call_id="c1")
+
+        async def async_handler(r):
+            return expected
+
+        result = await mw.awrap_tool_call(request, async_handler)
+        assert seen == ["tool_a"]
+        assert result is expected
+
+    @pytest.mark.asyncio
+    async def test_awrap_model_call_dispatches_to_task_middleware(self):
+        """Task middleware awrap_model_call override should be invoked."""
+        seen: list[str] = []
+
+        class WrapMw(TaskMiddleware):
+            async def awrap_model_call(self, request, handler):
+                seen.append("wrap")
+                return await handler(request)
+
+        tasks = [
+            Task(name="a", instruction="A", tools=[tool_a], middleware=WrapMw())
+        ]
+        mw = TaskSteeringMiddleware(tasks=tasks)
+
+        request = MockModelRequest(
+            state={"task_statuses": {"a": "in_progress"}},
+            system_message=MockSystemMessage("Base"),
+            tools=mw.tools,
+        )
+
+        async def async_handler(r):
+            return MagicMock()
+
+        await mw.awrap_model_call(request, async_handler)
+        assert seen == ["wrap"]
+
+
+class TestAsyncAbortLifecycle:
+    @pytest.mark.asyncio
+    async def test_async_abort_transition_skips_lifecycle(self):
+        """Async abort should return the handler's Command unchanged (no hooks fire)."""
+        ran: list[str] = []
+
+        class Hooks(TaskMiddleware):
+            async def aon_complete(self, state):
+                ran.append("aon_complete")
+                return None
+
+            async def aon_start(self, state):
+                ran.append("aon_start")
+                return None
+
+        tasks = [
+            Task(name="a", instruction="A", tools=[tool_a], middleware=Hooks()),
+        ]
+        mw = TaskSteeringMiddleware(tasks=tasks, required_tasks=[])
+
+        expected_msg = ToolMessage(
+            content="Task 'a' -> aborted.", tool_call_id="call-1"
+        )
+        expected = Command(
+            update={
+                "task_statuses": {"a": "aborted"},
+                "task_message_starts": {},
+                "messages": [expected_msg],
+            }
+        )
+
+        request = MockToolCallRequest(
+            tool_call={
+                "name": "update_task_status",
+                "args": {"task": "a", "status": "aborted"},
+                "id": "call-1",
+            },
+            state={
+                "task_statuses": {"a": "in_progress"},
+                "task_message_starts": {"a": 0},
+                "messages": [AIMessage(content="thinking", id="ai-1")],
+            },
+        )
+
+        async def async_handler(r):
+            return expected
+
+        result = await mw.awrap_tool_call(request, async_handler)
+        assert result is expected  # returned unchanged
+        assert ran == []
+
+    @pytest.mark.asyncio
+    async def test_async_abort_all_from_aon_complete(self):
+        """aon_complete returning AbortAll aborts remaining tasks in async path."""
+        from langchain_task_steering import AbortAll
+
+        class Aborter(TaskMiddleware):
+            async def aon_complete(self, state):
+                return AbortAll(reason="async stop")
+
+        tasks = [
+            Task(name="a", instruction="A", tools=[], middleware=Aborter()),
+            Task(name="b", instruction="B", tools=[]),
+        ]
+        mw = TaskSteeringMiddleware(tasks=tasks)
+
+        request = MockToolCallRequest(
+            tool_call={
+                "name": "update_task_status",
+                "args": {"task": "a", "status": "complete"},
+                "id": "call-1",
+            },
+            state={
+                "task_statuses": {"a": "in_progress", "b": "pending"},
+                "messages": [],
+            },
+        )
+
+        async def async_handler(r):
+            return Command(
+                update={
+                    "task_statuses": {"a": "complete", "b": "pending"},
+                    "messages": [
+                        ToolMessage(content="Task 'a' -> complete.", tool_call_id="call-1")
+                    ],
+                }
+            )
+
+        result = await mw.awrap_tool_call(request, async_handler)
+        assert isinstance(result, Command)
+        assert result.update["task_statuses"]["b"] == "aborted"
+        tool_msgs = [m for m in result.update["messages"] if isinstance(m, ToolMessage)]
+        assert "async stop" in tool_msgs[0].content
